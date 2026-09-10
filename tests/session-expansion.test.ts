@@ -359,4 +359,104 @@ describe("SessionExpansionService", () => {
     expect(fixture.hostAdds).toHaveLength(0);
     expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "cancelled" }]);
   });
+
+  it("keeps the claimed session when its thread is remapped during approval", async () => {
+    const fixture = createFixture();
+    let decide!: (value: unknown) => void;
+    let approvalSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { approvalSeen = resolve; });
+    fixture.deps.requestApproval = async () => new Promise((resolve) => { decide = resolve; approvalSeen(); });
+    const request = new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "thread-remap-1",
+    });
+    await seen;
+    fixture.store.updateSession(fixture.session.id, { threadId: "thr_old" });
+    const replacement = fixture.store.createSessionSnapshot(fixture.workspace.id, fixture.workspace.revision, [{ projectId: "proj_api", alias: "api" }], "thread-remap-replacement");
+    fixture.store.updateSession(replacement.id, { state: "active", hostId: "host_1", threadId: "thr_1" });
+    decide({ action: "add-once" });
+
+    expect(await request).toMatchObject({ added: true });
+    expect(fixture.hostAdds).toMatchObject([{ input: { sessionId: fixture.session.id } }]);
+  });
+
+  it("rereads session state after deferred project discovery before host mutation", async () => {
+    const fixture = createFixture();
+    let projectCalls = 0;
+    let releaseProjects!: (projects: Project[]) => void;
+    let finalLookupSeen!: () => void;
+    const finalLookup = new Promise<void>((resolve) => { finalLookupSeen = resolve; });
+    fixture.deps.listProjects = async () => {
+      projectCalls += 1;
+      if (projectCalls === 1) return fixture.projects;
+      finalLookupSeen();
+      return new Promise((resolve) => { releaseProjects = resolve; });
+    };
+    const request = new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "deferred-projects-1",
+    });
+    await finalLookup;
+    fixture.store.updateSession(fixture.session.id, { state: "archived" });
+    releaseProjects(fixture.projects);
+
+    expect(await request).toMatchObject({ added: false, error: expect.stringMatching(/active/i) });
+    expect(fixture.hostAdds).toHaveLength(0);
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "failed" }]);
+  });
+
+  it("reports a realtime publication failure once without changing the provisioned result", async () => {
+    const fixture = createFixture();
+    const reports: unknown[] = [];
+    let publishAttempts = 0;
+    fixture.deps.publishChanged = async () => { publishAttempts += 1; throw new Error("realtime unavailable"); };
+    fixture.deps.reportError = (report) => { reports.push(report); };
+
+    expect(await new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "report-publish-1",
+    })).toMatchObject({ added: true });
+    expect(reports).toEqual([{
+      operation: "workspaces-changed",
+      sessionId: fixture.session.id,
+      error: "realtime unavailable",
+    }]);
+    expect(publishAttempts).toBe(1);
+  });
+
+  it("records an AbortError during revalidation as failed rather than cancelled", async () => {
+    const fixture = createFixture();
+    let projectCalls = 0;
+    fixture.deps.listProjects = async () => {
+      projectCalls += 1;
+      if (projectCalls === 1) return fixture.projects;
+      const error = new Error("project lookup aborted");
+      error.name = "AbortError";
+      throw error;
+    };
+
+    expect(await new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "revalidation-abort-1",
+    })).toMatchObject({ added: false, error: "project lookup aborted" });
+    expect(fixture.hostAdds).toHaveLength(0);
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "failed" }]);
+  });
+
+  it("keeps a host AbortError pending and recovers it from its matching manifest operation", async () => {
+    const fixture = createFixture();
+    fixture.deps.addRepository = async () => {
+      const error = new Error("host request aborted");
+      error.name = "AbortError";
+      throw error;
+    };
+    const service = new SessionExpansionService(fixture.deps);
+    const input = { threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "host-abort-1" };
+
+    expect(await service.requestFromAgent(input)).toMatchObject({ added: false, pending: true, error: "host request aborted" });
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "pending" }]);
+    fixture.deps.readSession = async (sessionId) => ({
+      ...manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_audits", alias: "audits" }]),
+      operations: [{ key: "host-abort-1", projectId: "proj_audits", alias: "audits" }],
+    });
+
+    expect(await service.requestFromAgent(input)).toMatchObject({ added: true, recovered: true });
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "provisioned" }]);
+  });
 });

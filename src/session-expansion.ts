@@ -13,6 +13,7 @@ export type SessionExpansionDeps = {
   addRepository(input: { sessionId: string; operationKey: string; repository: { projectId: string; alias: string; sourcePath: string; baseRef: string } }, hostId: string): Promise<{ repository: ExpansionHostRepository; manifestRevision: number }>;
   readSession(sessionId: string, hostId: string): Promise<SessionManifest>;
   publishChanged(): Promise<void>;
+  reportError?(input: { operation: "workspaces-changed"; sessionId: string; error: string }): void;
 };
 export type AgentExpansionRequest = { threadId: string; alias: string; reason: string; requestKey: string; signal?: AbortSignal };
 export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string };
@@ -73,10 +74,16 @@ export class SessionExpansionService {
     if (!claim.claimed) return this.replay(claim.expansion);
     try {
       if (this.deps.store.getSession(session.id).expansionPolicy === "ask") {
-        const response = expansionApprovalResponseSchema.parse(await this.deps.requestApproval(expansionApprovalPayloadSchema.parse({
-          sessionId: session.id, workspaceName: session.workspaceName, repositoryAlias: option.alias, repositoryName: option.projectName, reason: input.reason,
-        }), input.signal));
-        if (response.action === "cancel") return this.terminal(this.cancel(input.requestKey, option.alias));
+        let response;
+        try {
+          response = expansionApprovalResponseSchema.parse(await this.deps.requestApproval(expansionApprovalPayloadSchema.parse({
+            sessionId: session.id, workspaceName: session.workspaceName, repositoryAlias: option.alias, repositoryName: option.projectName, reason: input.reason,
+          }), input.signal));
+        } catch (error) {
+          if (this.isAbort(error)) return this.terminal(this.cancel(input.requestKey, option.alias), session.id);
+          throw error;
+        }
+        if (response.action === "cancel") return this.terminal(this.cancel(input.requestKey, option.alias), session.id);
         if (response.action === "add-and-auto") {
           this.deps.store.setExpansionPolicy(session.id, "auto");
           this.deps.store.setExpansionApprovalMode(input.requestKey, "auto");
@@ -84,11 +91,10 @@ export class SessionExpansionService {
       } else {
         this.deps.store.setExpansionApprovalMode(input.requestKey, "auto");
       }
-      const result = await this.provision(input.threadId, option, input.requestKey);
-      return result.pending ? result : this.terminal(result);
+      const result = await this.provision(session.id, option, input.requestKey);
+      return result.pending ? result : this.terminal(result, session.id);
     } catch (error) {
-      if (this.isAbort(error)) return this.terminal(this.cancel(input.requestKey, option.alias));
-      return this.terminal(this.fail(input.requestKey, option.alias, error));
+      return this.terminal(this.fail(input.requestKey, option.alias, error), session.id);
     }
   }
 
@@ -101,18 +107,22 @@ export class SessionExpansionService {
     const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
     if (!claim.claimed) return this.replay(claim.expansion);
     try {
-      const result = await this.provision(input.threadId, option, input.requestKey);
-      return result.pending ? result : this.terminal(result);
+      const result = await this.provision(session.id, option, input.requestKey);
+      return result.pending ? result : this.terminal(result, session.id);
     } catch (error) {
-      return this.terminal(this.fail(input.requestKey, option.alias, error));
+      return this.terminal(this.fail(input.requestKey, option.alias, error), session.id);
     }
   }
 
-  private async provision(threadId: string, expected: ExpansionOption, requestKey: string): Promise<ExpansionResult> {
-    const session = this.sessionForThread(threadId);
-    const option = (await this.optionsForSession(session)).find((candidate) => candidate.projectId === expected.projectId && candidate.alias === expected.alias);
-    if (!option) throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
-    const added = await this.deps.addRepository({ sessionId: session.id, operationKey: requestKey, repository: { projectId: option.projectId, alias: option.alias, sourcePath: option.sourcePath, baseRef: "HEAD" } }, session.hostId!);
+  private async provision(sessionId: string, expected: ExpansionOption, requestKey: string): Promise<ExpansionResult> {
+    const { session, option } = await this.finalOption(sessionId, expected);
+    let added;
+    try {
+      added = await this.deps.addRepository({ sessionId: session.id, operationKey: requestKey, repository: { projectId: option.projectId, alias: option.alias, sourcePath: option.sourcePath, baseRef: "HEAD" } }, session.hostId!);
+    } catch (error) {
+      if (this.isAbort(error)) return this.pending(session.id, option.alias, this.message(error));
+      throw error;
+    }
     try {
       this.deps.store.appendProvisionedRepository({ sessionId: session.id, requestKey, repository: added.repository, manifestRevision: added.manifestRevision });
       return this.success(session.id, option.alias);
@@ -144,7 +154,7 @@ export class SessionExpansionService {
       const { snapshot, manifest } = await this.readAndReconcile(session);
       if (!this.manifestMatches(manifest, expansion.requestKey, option)) return this.pending(session.id, expansion.alias);
       this.deps.store.finishProvisionedExpansion(expansion.requestKey);
-      return this.terminal({ ...this.success(snapshot.id, expansion.alias), recovered: true });
+      return this.terminal({ ...this.success(snapshot.id, expansion.alias), recovered: true }, expansion.sessionId);
     } catch (error) {
       return this.pending(session.id, expansion.alias, this.message(error));
     }
@@ -167,6 +177,27 @@ export class SessionExpansionService {
     if (session.state !== "active") throw new Error("Only active workspace sessions can add repositories");
     if (!session.hostId) throw new Error("Session host is unavailable");
     return session;
+  }
+
+  private async finalOption(sessionId: string, expected: ExpansionOption): Promise<{ session: SessionSnapshot; option: ExpansionOption }> {
+    const projects = new Map((await this.deps.listProjects()).map((project) => [project.id, project]));
+    const session = this.deps.store.getSession(sessionId);
+    if (session.state !== "active") throw new Error("Only active workspace sessions can add repositories");
+    if (!session.workspaceId) throw new Error("The saved workspace is unavailable");
+    if (!session.hostId) throw new Error("Session host is unavailable");
+    let workspace;
+    try { workspace = this.deps.store.get(session.workspaceId); } catch { throw new Error("The saved workspace no longer exists"); }
+    const member = workspace.repositories.find((repository) => repository.projectId === expected.projectId && repository.alias === expected.alias);
+    if (!member) throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
+    if (session.repositories.some((repository) => repository.projectId === expected.projectId || repository.alias === expected.alias)) {
+      throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
+    }
+    const project = projects.get(expected.projectId);
+    if (!project) throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
+    const source = project.sources.find((candidate) => candidate.hostId === session.hostId && candidate.isDefault)
+      ?? project.sources.find((candidate) => candidate.hostId === session.hostId);
+    if (!source) throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
+    return { session, option: { projectId: project.id, alias: member.alias, projectName: project.name, sourcePath: source.path } };
   }
 
   private async optionsForSession(session: SessionSnapshot): Promise<ExpansionOption[]> {
@@ -197,8 +228,12 @@ export class SessionExpansionService {
     const expansion = this.deps.store.finishExpansion(requestKey, "failed", this.message(error));
     return { added: false, alias, policy: this.deps.store.getSession(expansion.sessionId).expansionPolicy, error: this.message(error) };
   }
-  private async terminal(result: ExpansionResult): Promise<ExpansionResult> {
-    try { await this.deps.publishChanged(); } catch { /* realtime is advisory after durable completion */ }
+  private async terminal(result: ExpansionResult, sessionId: string): Promise<ExpansionResult> {
+    try {
+      await this.deps.publishChanged();
+    } catch (error) {
+      try { this.deps.reportError?.({ operation: "workspaces-changed", sessionId, error: this.message(error) }); } catch {}
+    }
     return result;
   }
   private resultForReplay(expansion: SessionExpansion): ExpansionResult {
