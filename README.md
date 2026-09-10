@@ -14,9 +14,8 @@ The plugin follows a simple model:
 
 Open **Workspaces** in BB's navigation, create a workspace, and select the existing BB projects that belong together. To start a task:
 
-1. Choose the repositories needed for this task.
-2. Choose a primary repository when more than one is selected.
-3. Enter the task prompt and select **Start thread**.
+1. Choose the repositories needed for this task. The plugin remembers this selection per workspace.
+2. Enter the task prompt and select **Start thread**.
 
 All selected projects must have a source on the same BB host. The new thread starts at a root shaped like:
 
@@ -64,4 +63,5 @@ The implementation uses only the public BB Plugin SDK and includes a public-SDK 
 - Worktree paths and manifests are validated before cleanup.
 - Cleanup never uses `--force` and never deletes the generated branches.
 - Launches have an idempotency key, preventing UI retries from creating duplicate threads.
+- BB requires a project owner for every thread, so the plugin assigns the first selected workspace project internally and keeps that implementation detail out of the UI.
 - If thread creation fails after checkout preparation, the failed session remains visible with its worktrees intact.

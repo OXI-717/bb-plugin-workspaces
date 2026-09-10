@@ -35,7 +35,7 @@ export const rpcContract = defineRpcContract({
   workspace_remove: { input: z.object({ id: z.string(), expectedRevision: z.number().int() }), output: z.object({ removed: z.literal(true) }) },
   session_start: {
     input: z.object({
-      workspaceId: z.string(), expectedRevision: z.number().int(), hostId: z.string(), primaryProjectId: z.string(),
+      workspaceId: z.string(), expectedRevision: z.number().int(), hostId: z.string(),
       projectIds: z.array(z.string()).min(1).max(20), prompt: z.string().trim().min(1).max(100_000),
       requestKey: z.string().min(8).max(200),
     }),
@@ -80,16 +80,16 @@ export default async function plugin(bb: BbPluginApi) {
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
-    session_start: async ({ workspaceId, expectedRevision, hostId, primaryProjectId, projectIds, prompt, requestKey }) => {
+    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, requestKey }) => {
       const existing = store.getSessionByRequestKey(requestKey);
       if (existing) return existing;
       const workspace = store.get(workspaceId);
       if (workspace.revision !== expectedRevision) throw new Error("Workspace revision is stale");
       const selectedSet = new Set(projectIds);
       if (selectedSet.size !== projectIds.length) throw new Error("Select each repository only once");
-      if (!selectedSet.has(primaryProjectId)) throw new Error("Primary repository must be selected");
       const selected = workspace.repositories.filter((repository) => selectedSet.has(repository.projectId));
       if (selected.length !== selectedSet.size) throw new Error("One or more selected projects are not in this workspace");
+      const primaryProjectId = selected[0]!.projectId;
       const available = new Map((await projects()).map((project) => [project.id, project]));
       const resolved = selected.map((repository) => {
         const project = available.get(repository.projectId);
@@ -117,7 +117,7 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.spawn({
           projectId: primaryProjectId,
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: prepared.rootPath } },
-          prompt, title: `${workspace.name}: ${prompt.slice(0, 72)}`, visibility: "visible",
+          prompt, title: `🧩 ${workspace.name} · ${prompt.slice(0, 72)}`, visibility: "visible",
         });
         session = store.updateSession(session.id, { state: "active", threadId: thread.id }); changed(); return session;
       } catch (error) {

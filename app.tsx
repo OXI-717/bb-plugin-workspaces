@@ -4,6 +4,7 @@ import type { rpcContract } from "./server";
 import type { SessionSnapshot, Workspace, WorkspaceDraft } from "./src/contracts";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 
@@ -68,7 +69,7 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
     } finally { setPending(false); }
   };
   return (
-    <form onSubmit={submit} className="space-y-4 rounded-lg border border-border bg-card p-4">
+    <form onSubmit={submit} className="space-y-4">
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-name">Workspace name</label><Input id="workspace-name" aria-label="Workspace name" value={name} onChange={(event) => setName(event.target.value)} autoFocus /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-description">Description</label><Input id="workspace-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-instructions">Shared instructions</label><textarea id="workspace-instructions" className={`${fieldClass} min-h-24 resize-y`} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Context that applies whenever these repositories are used together" /></div>
@@ -83,11 +84,26 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
   );
 }
 
+function rememberedSelection(workspaceId: string, projectIds: string[]): Set<string> {
+  try {
+    const stored = globalThis.localStorage.getItem(`bb-workspaces:selection:${workspaceId}`);
+    if (stored !== null) {
+      const parsed: unknown = JSON.parse(stored);
+      if (Array.isArray(parsed)) {
+        const allowed = new Set(projectIds);
+        return new Set(parsed.filter((projectId): projectId is string => typeof projectId === "string" && allowed.has(projectId)));
+      }
+    }
+  } catch {
+    // Storage can be unavailable in privacy-restricted browser contexts.
+  }
+  return new Set(projectIds);
+}
+
 function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Workspace; projects: Project[]; rpc: ReturnType<typeof useRpc<typeof rpcContract>>; onError: (message: string) => void }) {
   const navigate = useBbNavigate();
   const memberProjects = workspace.repositories.map((member) => projects.find((project) => project.id === member.projectId)).filter((project): project is Project => Boolean(project));
-  const [selected, setSelected] = useState(() => new Set(memberProjects.slice(0, 1).map((project) => project.id)));
-  const [primary, setPrimary] = useState(memberProjects[0]?.id ?? "");
+  const [selected, setSelected] = useState(() => rememberedSelection(workspace.id, memberProjects.map((project) => project.id)));
   const [prompt, setPrompt] = useState("");
   const [pending, setPending] = useState(false);
   const [requestKey, setRequestKey] = useState(() => `launch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -97,14 +113,17 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     return [...new Set(chosen[0]!.sources.map((source) => source.hostId))].filter((hostId) => chosen.every((project) => project.sources.some((source) => source.hostId === hostId)));
   }, [memberProjects, selected]);
   const [hostId, setHostId] = useState(eligibleHosts[0] ?? "");
-  useEffect(() => { if (!selected.has(primary)) setPrimary([...selected][0] ?? ""); }, [selected, primary]);
+  useEffect(() => {
+    try { globalThis.localStorage.setItem(`bb-workspaces:selection:${workspace.id}`, JSON.stringify([...selected])); }
+    catch { /* Keep the in-memory selection when storage is unavailable. */ }
+  }, [selected, workspace.id]);
   useEffect(() => { if (!eligibleHosts.includes(hostId)) setHostId(eligibleHosts[0] ?? ""); }, [eligibleHosts, hostId]);
   const start = async (event: FormEvent) => {
     event.preventDefault();
-    if (!prompt.trim() || !primary || !eligibleHosts.includes(hostId) || pending) return;
+    if (!prompt.trim() || !eligibleHosts.includes(hostId) || pending) return;
     setPending(true); onError("");
     try {
-      const session = await rpc.call("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId, primaryProjectId: primary, projectIds: [...selected], prompt: prompt.trim(), requestKey });
+      const session = await rpc.call("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId, projectIds: [...selected], prompt: prompt.trim(), requestKey });
       if (session.threadId) { setRequestKey(`launch-${Date.now()}-${Math.random().toString(36).slice(2)}`); navigate.toThread(session.threadId); }
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setPending(false); }
@@ -112,7 +131,6 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
   return <form onSubmit={start} className="space-y-3 rounded-lg border border-border p-4">
     <div><h3 className="text-sm font-semibold">Start a task</h3><p className="text-xs text-muted-foreground">Each selected repository gets its own isolated worktree.</p></div>
     <div className="flex flex-wrap gap-2">{memberProjects.map((project) => <label key={project.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-sm"><Checkbox checked={selected.has(project.id)} onCheckedChange={(checked) => setSelected((current) => { const next = new Set(current); checked === true ? next.add(project.id) : next.delete(project.id); return next; })} aria-label={`Use ${project.name}`} />{project.name}</label>)}</div>
-    {selected.size > 1 ? <label className="block text-sm">Primary repository<select className={`${fieldClass} mt-1`} value={primary} onChange={(event) => setPrimary(event.target.value)}>{memberProjects.filter((project) => selected.has(project.id)).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label> : null}
     {eligibleHosts.length > 1 ? <label className="block text-sm">Host<select className={`${fieldClass} mt-1`} value={hostId} onChange={(event) => setHostId(event.target.value)}>{eligibleHosts.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></label> : null}
     {eligibleHosts.length === 0 && selected.size > 0 ? <p className="text-sm text-destructive">The selected repositories do not share a configured host.</p> : null}
     <textarea aria-label="Task prompt" className={`${fieldClass} min-h-28 resize-y`} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the outcome across these repositories…" />
@@ -161,11 +179,11 @@ function WorkspacesPage() {
   return <div className="h-full min-h-0 flex-1 overflow-y-auto"><div className="mx-auto w-full max-w-5xl space-y-4 px-4 pb-8 pt-4">
     <div className="flex items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Workspaces</h1><p className="text-sm text-muted-foreground">Group related repositories and run one isolated task across the ones you choose.</p></div><Button onClick={() => setEditing("new")}><Icon name="Plus" className="size-4" />New workspace</Button></div>
     {error ? <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p> : null}
-    {editing ? <WorkspaceForm projects={dashboard?.projects ?? []} initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={async (draft) => { try { editing === "new" ? await rpc.call("workspace_create", draft) : await rpc.call("workspace_update", { id: editing.id, expectedRevision: editing.revision, draft }); setEditing(null); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }} /> : null}
+    <Dialog open={editing !== null} onOpenChange={(open) => { if (!open) setEditing(null); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">{editing ? <><DialogHeader><DialogTitle>{editing === "new" ? "Create workspace" : "Edit workspace"}</DialogTitle><DialogDescription>Choose the BB projects that should be available together.</DialogDescription></DialogHeader><WorkspaceForm projects={dashboard?.projects ?? []} initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={async (draft) => { try { editing === "new" ? await rpc.call("workspace_create", draft) : await rpc.call("workspace_update", { id: editing.id, expectedRevision: editing.revision, draft }); setEditing(null); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }} /></> : null}</DialogContent></Dialog>
     {dashboard === null ? <Empty>Loading workspaces…</Empty> : active.length === 0 && !editing ? <Empty>No active workspaces. Create one or restore an archived workspace below.</Empty> : <div className="grid gap-4 md:grid-cols-[minmax(220px,0.7fr)_minmax(0,1.6fr)]">
       <aside className="space-y-2">{active.map((workspace) => <button key={workspace.id} onClick={() => setSelectedId(workspace.id)} className={`w-full rounded-lg border p-3 text-left ${selected?.id === workspace.id ? "border-foreground bg-muted" : "border-border bg-card hover:bg-muted/60"}`}><span className="block font-medium">{workspace.name}</span><span className="mt-1 block text-xs text-muted-foreground">{workspace.repositories.length} repositories</span></button>)}</aside>
       {selected ? <main className="space-y-4"><div className="rounded-lg border border-border bg-card p-4"><div className="flex items-start justify-between gap-2"><div><h2 className="text-lg font-semibold">{selected.name}</h2><p className="text-sm text-muted-foreground">{selected.description || "No description"}</p></div><div className="flex gap-1"><Button variant="ghost" size="sm" onClick={() => setEditing(selected)}>Edit</Button><Button variant="ghost" size="sm" onClick={async () => { await rpc.call("workspace_set_pinned", { id: selected.id, expectedRevision: selected.revision, pinned: !selected.pinned }); load(); }}>{selected.pinned ? "Unpin" : "Pin"}</Button><Button variant="ghost" size="sm" onClick={async () => { await rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: true }); setSelectedId(null); load(); }}>Archive</Button></div></div><div className="mt-3 flex flex-wrap gap-2">{selected.repositories.map((repository) => <span key={repository.projectId} className="rounded-full bg-muted px-2.5 py-1 text-xs">{repository.alias}</span>)}</div></div>
-        <SessionLauncher workspace={selected} projects={dashboard.projects} rpc={rpc} onError={(message) => setError(message || null)} />
+        <SessionLauncher key={selected.id} workspace={selected} projects={dashboard.projects} rpc={rpc} onError={(message) => setError(message || null)} />
         <section><h3 className="mb-2 text-sm font-semibold">Sessions</h3>{dashboard.sessions.filter((session) => session.workspaceId === selected.id).length === 0 ? <Empty>No workspace sessions yet.</Empty> : <div className="space-y-2">{dashboard.sessions.filter((session) => session.workspaceId === selected.id).map((session) => <SessionRow key={session.id} session={session} rpc={rpc} onChanged={load} onError={(message) => setError(message)} />)}</div>}</section>
       </main> : null}
     </div>}

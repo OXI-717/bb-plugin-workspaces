@@ -113,8 +113,7 @@ describe("Workspaces plugin server", () => {
       workspaceId: workspace.id,
       expectedRevision: workspace.revision,
       hostId: "host_local",
-      primaryProjectId: "proj_auth",
-      projectIds: ["proj_auth", "proj_gateway"],
+      projectIds: ["proj_gateway", "proj_auth"],
       prompt: "Change the auth contract in both services.",
       requestKey: "request-auth-contract",
     }) as { id: string; state: string; threadId: string };
@@ -122,8 +121,7 @@ describe("Workspaces plugin server", () => {
       workspaceId: workspace.id,
       expectedRevision: workspace.revision,
       hostId: "host_local",
-      primaryProjectId: "proj_auth",
-      projectIds: ["proj_auth", "proj_gateway"],
+      projectIds: ["proj_gateway", "proj_auth"],
       prompt: "Change the auth contract in both services.",
       requestKey: "request-auth-contract",
     }) as { id: string };
@@ -137,6 +135,7 @@ describe("Workspaces plugin server", () => {
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
       projectId: "proj_auth",
       prompt: "Change the auth contract in both services.",
+      title: "🧩 Authentication · Change the auth contract in both services.",
       environment: {
         type: "host",
         hostId: "host_local",
