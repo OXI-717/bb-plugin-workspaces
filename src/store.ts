@@ -74,6 +74,11 @@ export type BeginExpansionInput = {
   requestKey: string;
 };
 
+export type ExpansionClaim = {
+  expansion: SessionExpansion;
+  claimed: boolean;
+};
+
 export type AppendProvisionedRepositoryInput = {
   sessionId: string;
   requestKey: string;
@@ -310,9 +315,13 @@ export class WorkspaceStore {
   }
 
   beginExpansion(input: BeginExpansionInput): SessionExpansion {
+    return this.claimExpansion(input).expansion;
+  }
+
+  claimExpansion(input: BeginExpansionInput): ExpansionClaim {
     return this.db.transaction(() => {
       const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(input.requestKey) as ExpansionRow | undefined;
-      if (existing) return this.hydrateExpansion(existing);
+      if (existing) return { expansion: this.hydrateExpansion(existing), claimed: false };
       this.getSession(input.sessionId);
       const now = Date.now();
       const id = `expansion_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -320,7 +329,7 @@ export class WorkspaceStore {
         (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`)
         .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now);
-      return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE id = ?").get(id) as ExpansionRow);
+      return { expansion: this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE id = ?").get(id) as ExpansionRow), claimed: true };
     })();
   }
 

@@ -193,6 +193,10 @@ describe("SessionExpansionService", () => {
       if (failOnce) { failOnce = false; throw new Error("database write failed"); }
       return originalAppend(input);
     }) as typeof fixture.store.appendProvisionedRepository;
+    fixture.deps.readSession = async (sessionId) => ({
+      ...manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_audits", alias: "audits" }]),
+      operations: [{ key: "recovery-1", projectId: "proj_audits", alias: "audits" }],
+    });
     const service = new SessionExpansionService(fixture.deps);
 
     expect(await service.requestFromAgent({ threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "recovery-1" })).toMatchObject({ added: true, recovered: true });
@@ -231,5 +235,128 @@ describe("SessionExpansionService", () => {
     await service.reconcileActiveSessions();
     expect(active.store.getSession(active.session.id).repositories).toHaveLength(2);
     expect(active.store.getSession(archivedSession.id).repositories).toHaveLength(1);
+  });
+
+  it("rechecks eligibility after approval before calling the host", async () => {
+    const fixture = createFixture();
+    let decide!: (value: unknown) => void;
+    let approvalSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { approvalSeen = resolve; });
+    fixture.deps.requestApproval = async (payload) => {
+      fixture.approvals.push(payload);
+      return new Promise((resolve) => { decide = resolve; approvalSeen(); });
+    };
+    const request = new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "stale-approval-1",
+    });
+    await seen;
+    fixture.store.remove(fixture.workspace.id, fixture.workspace.revision);
+    decide({ action: "add-once" });
+
+    expect(await request).toMatchObject({ added: false, error: expect.stringMatching(/workspace/i) });
+    expect(fixture.hostAdds).toHaveLength(0);
+  });
+
+  it("claims simultaneous request keys once for approval, host provisioning, and publication", async () => {
+    const fixture = createFixture();
+    let decide!: (value: unknown) => void;
+    let approvalSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { approvalSeen = resolve; });
+    fixture.deps.requestApproval = async (payload) => {
+      fixture.approvals.push(payload);
+      return new Promise((resolve) => { decide = resolve; approvalSeen(); });
+    };
+    const service = new SessionExpansionService(fixture.deps);
+    const input = { threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "same-request-1" };
+    const first = service.requestFromAgent(input);
+    const second = service.requestFromAgent(input);
+    await seen;
+    expect(fixture.approvals).toHaveLength(1);
+    decide({ action: "add-once" });
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { added: true, alias: "audits", policy: "ask" },
+      { added: true, alias: "audits", policy: "ask" },
+    ]);
+    expect(fixture.hostAdds).toHaveLength(1);
+    expect(fixture.publications).toHaveLength(1);
+  });
+
+  it("keeps disk-present expansion pending until a replay repairs its matching manifest operation", async () => {
+    const fixture = createFixture();
+    fixture.store.appendProvisionedRepository = (() => { throw new Error("database unavailable"); }) as typeof fixture.store.appendProvisionedRepository;
+    let available = false;
+    fixture.deps.readSession = async (sessionId) => {
+      if (!available) throw new Error("manifest unavailable");
+      return { ...manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_audits", alias: "audits" }]), operations: [{ key: "pending-disk-1", projectId: "proj_audits", alias: "audits" }] };
+    };
+    const service = new SessionExpansionService(fixture.deps);
+    const input = { threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "pending-disk-1" };
+
+    expect(await service.requestFromAgent(input)).toMatchObject({ added: false, pending: true, error: expect.stringMatching(/exists on disk/i) });
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "pending" }]);
+    available = true;
+    expect(await service.requestFromAgent(input)).toMatchObject({ added: true, recovered: true });
+    expect(fixture.hostAdds).toHaveLength(1);
+    expect(fixture.publications).toHaveLength(1);
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "provisioned" }]);
+  });
+
+  it("does not let notification failure alter a provisioned outcome or trigger recovery", async () => {
+    const fixture = createFixture();
+    let attempts = 0;
+    fixture.deps.publishChanged = async () => { attempts += 1; throw new Error("realtime unavailable"); };
+
+    expect(await new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "publish-failure-1",
+    })).toMatchObject({ added: true });
+    expect(attempts).toBe(1);
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "provisioned" }]);
+  });
+
+  it("rejects an alias already used by a different session project before host mutation", async () => {
+    const fixture = createFixture();
+    fixture.store.reconcileRepositories(fixture.session.id, [
+      { projectId: "proj_api", alias: "api" },
+      { projectId: "proj_existing", alias: "audits" },
+    ], 2);
+
+    await expect(new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "alias-collision-1",
+    })).rejects.toThrow(/eligible/i);
+    expect(fixture.hostAdds).toHaveLength(0);
+  });
+
+  it("returns per-session bulk reconciliation failures while retaining successful repairs", async () => {
+    const fixture = createFixture();
+    const second = fixture.store.createSessionSnapshot(fixture.workspace.id, fixture.workspace.revision, [{ projectId: "proj_api", alias: "api" }], "bulk-second-1");
+    fixture.store.updateSession(second.id, { state: "active", hostId: "host_1", threadId: "thr_second" });
+    fixture.deps.readSession = async (sessionId) => {
+      if (sessionId === second.id) throw new Error("second host unavailable");
+      return manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_audits", alias: "audits" }]);
+    };
+
+    const results = await new SessionExpansionService(fixture.deps).reconcileActiveSessions();
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: fixture.session.id, session: expect.objectContaining({ id: fixture.session.id }) }),
+      expect.objectContaining({ sessionId: second.id, error: "second host unavailable" }),
+    ]));
+    expect(fixture.store.getSession(fixture.session.id).repositories).toHaveLength(2);
+    expect(fixture.store.getSession(second.id).repositories).toHaveLength(1);
+  });
+
+  it("records an aborted approval as cancelled without calling the host", async () => {
+    const fixture = createFixture();
+    fixture.deps.requestApproval = async () => {
+      const error = new Error("approval aborted");
+      error.name = "AbortError";
+      throw error;
+    };
+
+    expect(await new SessionExpansionService(fixture.deps).requestFromAgent({
+      threadId: "thr_1", alias: "audits", reason: "Need audits.", requestKey: "approval-abort-1",
+    })).toMatchObject({ added: false, cancelled: true });
+    expect(fixture.hostAdds).toHaveLength(0);
+    expect(fixture.store.getSession(fixture.session.id).expansions).toMatchObject([{ outcome: "cancelled" }]);
   });
 });
