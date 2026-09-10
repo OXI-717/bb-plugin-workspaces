@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent } from "@testing-library/react";
+import { act, fireEvent } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
@@ -61,6 +61,20 @@ const expansionOption = {
   sourcePath: "/repos/gateway",
 };
 
+const billingOption = {
+  projectId: "proj_billing",
+  alias: "billing",
+  projectName: "billing-service",
+  sourcePath: "/repos/billing",
+};
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 describe("repository approval interaction", () => {
   const validPayload = {
     sessionId: "session_auth",
@@ -109,6 +123,33 @@ describe("repository approval interaction", () => {
 
     await expect.poll(() => cancellations).toBe(1);
     expect(submissions).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+
+  it.each([
+    ["submit", validPayload, "Add this repo"],
+    ["cancel", { workspaceName: "malformed" }, "Cancel"],
+  ])("does not let stale %s completion overwrite a replacement interaction", async (kind, payload, buttonName) => {
+    const app = await loadPluginApp(() => import("../app"));
+    const approval = app.pendingInteractions.find((registration) => registration.id === "workspace-add-repository")!;
+    const stale = deferred<void>();
+    const current = deferred<void>();
+    const slot = renderSlot(approval, {
+      interaction: { id: "approval-a", threadId: "thr_auth", title: "Add repository", payload, createdAt: 1, expiresAt: null },
+      submit: async () => kind === "submit" ? stale.promise : undefined,
+      cancel: async () => kind === "cancel" ? stale.promise : undefined,
+    });
+
+    fireEvent.click(await slot.findByRole("button", { name: buttonName }));
+    const Approval = approval.component;
+    slot.lifecycle.rerender(<Approval interaction={{ id: "approval-b", threadId: "thr_auth", title: "Add repository", payload: validPayload, createdAt: 2, expiresAt: null }} submit={async () => current.promise} cancel={async () => {}} />);
+    fireEvent.click(await slot.findByRole("button", { name: "Add and auto-approve more" }));
+    expect(slot.getByRole("button", { name: "Add and auto-approve more" }).hasAttribute("disabled")).toBe(true);
+
+    await act(async () => { stale.reject(new Error("stale completion")); await stale.promise.catch(() => {}); });
+    expect(slot.queryByRole("alert")).toBeNull();
+    expect(slot.getByRole("button", { name: "Add and auto-approve more" }).hasAttribute("disabled")).toBe(true);
+    await act(async () => { current.resolve(); await current.promise; });
     slot.lifecycle.unmount();
   });
 });
@@ -243,6 +284,78 @@ describe("Repositories panel", () => {
     await slot.behavior.emitRealtime("workspaces-changed", { at: 2 });
     expect(await slot.findByText("All current workspace repositories are already available.")).toBeTruthy();
     expect(slot.getByText("Editing this workspace changes future repository eligibility; it does not change this session.")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps only the latest thread's overlapping option response", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const panel = app.threadPanelActions[0]!;
+    const first = deferred<{ session: typeof activeSession; repositories: typeof expansionOption[] }>();
+    const secondSession = { ...activeSession, id: "session_billing", threadId: "thr_billing" };
+    const second = deferred<{ session: typeof secondSession; repositories: typeof billingOption[] }>();
+    const calls: string[] = [];
+    const slot = renderSlot(panel, { threadId: "thr_auth", params: null }, {
+      rpc: {
+        dashboard: () => ({ workspaces: [workspace], sessions: [activeSession, secondSession], projects: [project, gatewayProject] }),
+        session_expansion_options: (input: unknown) => {
+          const threadId = (input as { threadId: string }).threadId;
+          calls.push(threadId);
+          return threadId === "thr_auth" ? first.promise : second.promise;
+        },
+      },
+    });
+
+    await expect.poll(() => calls).toEqual(["thr_auth"]);
+    const Panel = panel.component;
+    slot.lifecycle.rerender(<Panel threadId="thr_billing" params={null} />);
+    await expect.poll(() => calls).toEqual(["thr_auth", "thr_billing"]);
+    await act(async () => { second.resolve({ session: secondSession, repositories: [billingOption] }); await second.promise; });
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    expect((await slot.findByLabelText("Repository to add") as HTMLSelectElement).value).toBe("proj_billing");
+    await act(async () => { first.resolve({ session: activeSession, repositories: [expansionOption] }); await first.promise; });
+    expect((slot.getByLabelText("Repository to add") as HTMLSelectElement).value).toBe("proj_billing");
+    slot.lifecycle.unmount();
+  });
+
+  it("closes an open form when realtime removes its selected option", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    let repositories = [expansionOption, billingOption];
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, {
+      rpc: {
+        dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+        session_expansion_options: () => ({ session: activeSession, repositories }),
+      },
+    });
+
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    fireEvent.change(await slot.findByLabelText("Repository to add"), { target: { value: "proj_billing" } });
+    repositories = [expansionOption];
+    await slot.behavior.emitRealtime("workspaces-changed", { at: 3 });
+    await expect.poll(() => slot.queryByLabelText("Repository to add")).toBeNull();
+    expect(slot.getByRole("button", { name: "Add repository" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("closes and disables manual addition when latest options report an inactive session", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const inactiveSession = { ...activeSession, state: "archived" as const };
+    let latestSession: typeof activeSession | typeof inactiveSession = activeSession;
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, {
+      rpc: {
+        dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+        session_expansion_options: () => ({ session: latestSession, repositories: [expansionOption] }),
+      },
+    });
+
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    expect(await slot.findByLabelText("Repository to add")).toBeTruthy();
+    latestSession = inactiveSession;
+    await slot.behavior.emitRealtime("workspaces-changed", { at: 4 });
+    await expect.poll(() => slot.queryByLabelText("Repository to add")).toBeNull();
+    expect(slot.queryByRole("button", { name: "Add repository" })).toBeNull();
+    latestSession = activeSession;
+    await slot.behavior.emitRealtime("workspaces-changed", { at: 5 });
+    expect(await slot.findByRole("button", { name: "Add repository" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 });
