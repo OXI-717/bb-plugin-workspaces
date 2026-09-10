@@ -287,6 +287,32 @@ describe("Repositories panel", () => {
     slot.lifecycle.unmount();
   });
 
+  it.each(["resolve", "reject"])("ignores a stale mount options %s after a newer realtime refresh", async (outcome) => {
+    const app = await loadPluginApp(() => import("../app"));
+    const mount = deferred<{ session: typeof activeSession; repositories: typeof expansionOption[] }>();
+    const realtime = deferred<{ session: typeof activeSession; repositories: typeof expansionOption[] }>();
+    let calls = 0;
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, {
+      rpc: {
+        dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+        session_expansion_options: () => calls++ === 0 ? mount.promise : realtime.promise,
+      },
+    });
+
+    await expect.poll(() => calls).toBe(1);
+    await slot.behavior.emitRealtime("workspaces-changed", { at: 3 });
+    await expect.poll(() => calls).toBe(2);
+    await act(async () => { realtime.resolve({ session: activeSession, repositories: [] }); await realtime.promise; });
+    expect(await slot.findByText("All current workspace repositories are already available.")).toBeTruthy();
+
+    if (outcome === "resolve") await act(async () => { mount.resolve({ session: activeSession, repositories: [expansionOption] }); await mount.promise; });
+    else await act(async () => { mount.reject(new Error("stale mount failure")); await mount.promise.catch(() => {}); });
+
+    expect(slot.queryByRole("button", { name: "Add repository" })).toBeNull();
+    expect(slot.queryByRole("alert")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("keeps only the latest thread's overlapping option response", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const panel = app.threadPanelActions[0]!;

@@ -243,6 +243,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const [adding, setAdding] = useState(false);
   const requestKey = useRef<string | null>(null);
   const generation = useRef(0);
+  const latestOptionsRequest = useRef(0);
   const currentThreadId = useRef(threadId);
   const latestOptions = useRef<ExpansionOption[]>([]);
   const latestOptionsSessionState = useRef<SessionSnapshot["state"] | null>(null);
@@ -257,6 +258,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   }, []);
   useEffect(() => {
     generation.current += 1; currentThreadId.current = threadId;
+    latestOptionsRequest.current += 1;
     latestOptions.current = []; latestOptionsSessionState.current = null;
     addPending.current = false; requestKey.current = null;
     addFormOpen.current = false; selectedProjectIdRef.current = "";
@@ -264,14 +266,16 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   }, [threadId]);
   const loadOptions = useCallback(async () => {
     const requestGeneration = generation.current;
+    const requestSequence = latestOptionsRequest.current + 1;
+    latestOptionsRequest.current = requestSequence;
     try {
       const result = await rpc.call("session_expansion_options", { threadId });
-      if (generation.current !== requestGeneration || currentThreadId.current !== threadId) return;
+      if (generation.current !== requestGeneration || currentThreadId.current !== threadId || latestOptionsRequest.current !== requestSequence) return;
       latestOptions.current = result.repositories; latestOptionsSessionState.current = result.session.state;
       setOptions(result.repositories); setOptionsSessionState(result.session.state); setOptionsError(null);
       if (result.session.state !== "active" || (addFormOpen.current && !result.repositories.some((option) => option.projectId === selectedProjectIdRef.current))) closeAddForm();
     } catch (cause) {
-      if (generation.current === requestGeneration && currentThreadId.current === threadId) setOptionsError(cause instanceof Error ? cause.message : String(cause));
+      if (generation.current === requestGeneration && currentThreadId.current === threadId && latestOptionsRequest.current === requestSequence) setOptionsError(cause instanceof Error ? cause.message : String(cause));
     }
   }, [closeAddForm, rpc, threadId]);
   useEffect(() => { void loadOptions(); }, [loadOptions]);
