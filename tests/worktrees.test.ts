@@ -1,9 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanupSession, prepareSession, readRepositoryStatus } from "../src/worktrees";
+import {
+  addRepository,
+  cleanupSession,
+  ensureAnchor,
+  prepareSession,
+  readRepositoryStatus,
+  readSessionManifest,
+} from "../src/worktrees";
 
 const roots: string[] = [];
 
@@ -28,6 +35,25 @@ afterEach(() => {
 });
 
 describe("multi-repository session worktrees", () => {
+  it("creates and validates a stable non-Git workspace anchor", async () => {
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const anchor = await ensureAnchor(dataRoot);
+
+    expect(anchor.path).toBe(join(dataRoot, "workspace-anchor"));
+    expect(JSON.parse(readFileSync(join(anchor.path, ".bb-workspaces-anchor.json"), "utf8"))).toEqual({
+      schemaVersion: 1,
+      owner: "bb-plugin-workspaces",
+    });
+    expect(existsSync(join(anchor.path, ".git"))).toBe(false);
+    expect(await ensureAnchor(dataRoot)).toEqual(anchor);
+
+    writeFileSync(join(anchor.path, ".bb-workspaces-anchor.json"), JSON.stringify({ schemaVersion: 1, owner: "other" }));
+    await expect(ensureAnchor(dataRoot)).rejects.toThrow(/anchor/i);
+    expect(existsSync(anchor.path)).toBe(true);
+  });
+
   it("creates isolated worktrees and a compact repository map", async () => {
     const auth = repository("auth");
     const gateway = repository("gateway");
@@ -55,6 +81,164 @@ describe("multi-repository session worktrees", () => {
       "bb-workspace/session-abc/auth",
       "bb-workspace/session-abc/gateway",
     ]);
+    expect(readSessionManifest(dataRoot, "session_abc")).toMatchObject({
+      schemaVersion: 2,
+      owner: "bb-plugin-workspaces",
+      revision: 1,
+      operations: [],
+      instructions: "Run contract tests before finishing.",
+    });
+  });
+
+  it("upgrades a valid schema-v1 manifest in memory", async () => {
+    const auth = repository("auth");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_legacy", workspaceName: "Legacy", instructions: "Keep focused.",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+    writeFileSync(join(prepared.rootPath, "session.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      sessionId: "session_legacy",
+      workspaceName: "Legacy",
+      repositories: prepared.repositories,
+    })}\n`);
+
+    expect(readSessionManifest(dataRoot, "session_legacy")).toMatchObject({
+      schemaVersion: 2,
+      owner: "bb-plugin-workspaces",
+      revision: 1,
+      operations: [],
+      instructions: "",
+      repositories: [{ alias: "auth", worktreePath: join(prepared.rootPath, "repos/auth") }],
+    });
+  });
+
+  it("adds a repository once and replays duplicate operations without another worktree", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await prepareSession({
+      dataRoot, sessionId: "session_expand", workspaceName: "Expand", instructions: "Keep focused.",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+    const request = {
+      dataRoot, sessionId: "session_expand", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+    };
+
+    const added = await addRepository(request);
+    const replayed = await addRepository(request);
+    const duplicateProject = await addRepository({
+      ...request,
+      operationKey: "expand-audits-2",
+      repository: { ...request.repository, alias: "different-alias" },
+    });
+    const manifest = readSessionManifest(dataRoot, "session_expand");
+
+    expect(manifest.repositories.at(-1)).toMatchObject({ alias: "audits", worktreePath: added.repository.worktreePath });
+    expect(replayed).toEqual(added);
+    expect(duplicateProject).toEqual(added);
+    expect(manifest).toMatchObject({ revision: 2, operations: [{ key: "expand-audits-1", projectId: "proj_audits", alias: "audits" }] });
+    expect(git(audits.path, "branch", "--list", "bb-workspace/session-expand/*").split("\n").filter(Boolean)).toHaveLength(1);
+    expect(readFileSync(join(added.repository.worktreePath, "README.md"), "utf8")).toBe("audits\n");
+  });
+
+  it("rejects unsafe additions and manifests that do not prove session ownership", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_validation", workspaceName: "Validation", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+
+    await expect(addRepository({
+      dataRoot, sessionId: "session_validation", operationKey: "expand-invalid-1",
+      repository: { projectId: "proj_audits", alias: "../audits", sourcePath: audits.path, baseRef: "HEAD" },
+    })).rejects.toThrow(/alias/i);
+    expect(git(audits.path, "branch", "--list", "bb-workspace/session-validation/*")).toBe("");
+
+    const manifestPath = join(prepared.rootPath, "session.json");
+    const valid = JSON.parse(readFileSync(manifestPath, "utf8"));
+    writeFileSync(manifestPath, JSON.stringify({ ...valid, owner: "someone-else" }));
+    await expect(addRepository({
+      dataRoot, sessionId: "session_validation", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+    })).rejects.toThrow(/owner/i);
+    expect(git(audits.path, "branch", "--list", "bb-workspace/session-validation/*")).toBe("");
+
+    writeFileSync(manifestPath, JSON.stringify({ ...valid, owner: undefined }));
+    expect(() => readSessionManifest(dataRoot, "session_validation")).toThrow(/owner/i);
+  });
+
+  it("atomically replaces the manifest without leaving readable temporary metadata", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_atomic", workspaceName: "Atomic", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+
+    await addRepository({
+      dataRoot, sessionId: "session_atomic", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+    });
+
+    const manifestPath = join(prepared.rootPath, "session.json");
+    expect(readSessionManifest(dataRoot, "session_atomic").revision).toBe(2);
+    expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(prepared.rootPath).filter((name) => name.startsWith(".session.json."))).toEqual([]);
+  });
+
+  it("rolls back only a new worktree and branch when manifest publishing fails", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_rollback", workspaceName: "Rollback", instructions: "Keep prior instructions.",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+    const priorAgents = readFileSync(join(prepared.rootPath, "AGENTS.md"), "utf8");
+
+    await expect(addRepository({
+      dataRoot, sessionId: "session_rollback", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+      fileOperations: { writeAtomic: async () => { throw new Error("metadata unavailable"); } },
+    })).rejects.toThrow(/metadata unavailable/);
+
+    expect(readFileSync(join(prepared.rootPath, "AGENTS.md"), "utf8")).toBe(priorAgents);
+    expect(existsSync(join(prepared.rootPath, "repos/audits"))).toBe(false);
+    expect(git(audits.path, "branch", "--list", "bb-workspace/session-rollback/audits")).toBe("");
+    expect(readSessionManifest(dataRoot, "session_rollback").revision).toBe(1);
+  });
+
+  it("serializes concurrent additions for one session into one repository", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await prepareSession({
+      dataRoot, sessionId: "session_concurrent", workspaceName: "Concurrent", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+
+    const results = await Promise.all([
+      addRepository({ dataRoot, sessionId: "session_concurrent", operationKey: "expand-audits-1", repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" } }),
+      addRepository({ dataRoot, sessionId: "session_concurrent", operationKey: "expand-audits-2", repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" } }),
+    ]);
+    const manifest = readSessionManifest(dataRoot, "session_concurrent");
+
+    expect(results[0]).toEqual(results[1]);
+    expect(manifest.repositories.filter((entry) => entry.projectId === "proj_audits")).toHaveLength(1);
+    expect(git(audits.path, "branch", "--list", "bb-workspace/session-concurrent/audits").split("\n").filter(Boolean)).toHaveLength(1);
+    expect(existsSync(join(dataRoot, "sessions/session_concurrent/repos/audits"))).toBe(true);
   });
 
   it("reports repository changes independently", async () => {

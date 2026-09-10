@@ -1,7 +1,7 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-const preparedRepositorySchema = z.object({
+export const preparedRepositorySchema = z.object({
   projectId: z.string(),
   alias: z.string(),
   sourcePath: z.string(),
@@ -9,7 +9,24 @@ const preparedRepositorySchema = z.object({
   baseCommit: z.string(),
   branch: z.string(),
   worktreePath: z.string(),
-});
+}).strict();
+
+const manifestOperationSchema = z.object({
+  key: z.string(),
+  projectId: z.string(),
+  alias: z.string(),
+}).strict();
+
+export const sessionManifestSchema = z.object({
+  schemaVersion: z.literal(2),
+  owner: z.literal("bb-plugin-workspaces"),
+  sessionId: z.string(),
+  workspaceName: z.string(),
+  instructions: z.string(),
+  revision: z.number().int().positive(),
+  repositories: z.array(preparedRepositorySchema),
+  operations: z.array(manifestOperationSchema),
+}).strict();
 
 export const hostContract = defineRpcContract({
   prepare_session: {
@@ -28,6 +45,30 @@ export const hostContract = defineRpcContract({
       rootPath: z.string(),
       repositories: z.array(preparedRepositorySchema),
     }),
+  },
+  ensure_anchor: {
+    input: z.object({}).strict(),
+    output: z.object({ path: z.string() }).strict(),
+  },
+  read_session: {
+    input: z.object({ sessionId: z.string().regex(/^session_[a-zA-Z0-9-]+$/) }).strict(),
+    output: sessionManifestSchema,
+  },
+  add_repository: {
+    input: z.object({
+      sessionId: z.string().regex(/^session_[a-zA-Z0-9-]+$/),
+      operationKey: z.string().min(8).max(200),
+      repository: z.object({
+        projectId: z.string().min(1),
+        alias: z.string().regex(/^[a-z][a-z0-9-]{0,47}$/),
+        sourcePath: z.string().min(1),
+        baseRef: z.string().min(1),
+      }).strict(),
+    }).strict(),
+    output: z.object({
+      repository: preparedRepositorySchema,
+      manifestRevision: z.number().int().positive(),
+    }).strict(),
   },
   cleanup_session: {
     input: z.object({
