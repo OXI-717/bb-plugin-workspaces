@@ -80,6 +80,7 @@ export const rpcContract = defineRpcContract({
 });
 
 const WORKSPACES_CHANGED = "workspaces-changed";
+const SESSION_RECONCILIATION_ERROR_MAX_CHARS = 500;
 
 export default async function plugin(bb: BbPluginApi) {
   const database = bb.storage.database();
@@ -164,9 +165,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  function resultWithSession(threadId: string, result: ExpansionResult) {
-    const session = store.getSessionByThreadId(threadId);
-    if (!session) throw new Error("This thread is not a workspace session");
+  function resultWithSession(result: ExpansionResult) {
+    const { session } = result;
     return {
       added: result.added,
       alias: result.alias,
@@ -181,10 +181,15 @@ export default async function plugin(bb: BbPluginApi) {
     const errors = new Map<string, string>();
     for (const result of results) {
       if (!result.error) continue;
-      errors.set(result.sessionId, result.error);
+      errors.set(result.sessionId, sanitizeReconciliationError(result.error));
       bb.log.warn(`Workspaces session reconciliation failed: ${JSON.stringify({ sessionId: result.sessionId.slice(0, 200), error: result.error.slice(0, 1_000) })}`);
     }
     return errors;
+  }
+
+  function sanitizeReconciliationError(error: string): string {
+    const normalized = error.replace(/\s+/g, " ").trim();
+    return (normalized || "Unknown reconciliation error").slice(0, SESSION_RECONCILIATION_ERROR_MAX_CHARS);
   }
 
   function sessionsWithReconciliationErrors(errors: ReadonlyMap<string, string>) {
@@ -204,7 +209,7 @@ export default async function plugin(bb: BbPluginApi) {
       reason: z.string().trim().min(1).max(2_000),
     }).strict(),
     async execute({ repository, reason }, { threadId, signal }) {
-      const result = resultWithSession(threadId, await expansion.requestFromAgent({
+      const result = resultWithSession(await expansion.requestFromAgent({
         threadId, alias: repository, reason, requestKey: `agent-${randomUUID()}`, signal,
       }));
       return result.added
@@ -325,7 +330,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { session: reconciled, repositories: await expansion.optionsForThread(threadId) };
     },
     session_add_repository: async ({ threadId, projectId, requestKey }) => {
-      return resultWithSession(threadId, await expansion.addManually({
+      return resultWithSession(await expansion.addManually({
         threadId, projectId, requestKey, reason: "Added from the Repositories panel",
       }));
     },

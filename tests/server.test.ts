@@ -70,6 +70,63 @@ describe("Workspaces plugin server", () => {
     expect(harness.inspection.sdk.callsTo("projects.delete")).toHaveLength(0);
   });
 
+  it("keeps reconciliation failures single-line and bounded in dashboard and CLI session output", async () => {
+    const availableProjects = [...projects];
+    const failure = `manifest unavailable\n${"x".repeat(1_000)}`;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "workspaces",
+      sdk: {
+        projects: {
+          list: async () => availableProjects,
+          create: async ({ name, source }) => {
+            const created = {
+              ...projects[0]!, id: "proj_workspaces", name,
+              sources: [{ ...projects[0]!.sources[0]!, id: "src_workspaces", projectId: "proj_workspaces", hostId: source.hostId, path: source.path }],
+            };
+            availableProjects.push(created);
+            return created;
+          },
+        },
+        threads: { spawn: async () => makeThreadResponse({ id: "thr_reconciliation", projectId: "proj_workspaces" }) },
+      },
+      experimental_hostEntry: true,
+      experimental_callHostRpc: async ({ method, input }) => {
+        if (method === "ensure_anchor") return { path: "/plugin/anchor" };
+        if (method === "prepare_session") {
+          const request = input as { sessionId: string; repositories: Array<{ projectId: string; alias: string; sourcePath: string; baseRef: string }> };
+          return {
+            rootPath: `/plugin-data/sessions/${request.sessionId}`,
+            repositories: request.repositories.map((repository) => ({
+              ...repository, baseCommit: `commit-${repository.alias}`,
+              branch: `bb-workspace/${request.sessionId}/${repository.alias}`,
+              worktreePath: `/plugin-data/sessions/${request.sessionId}/repos/${repository.alias}`,
+            })),
+          };
+        }
+        if (method === "read_session") throw new Error(failure);
+        throw new Error(`Unexpected host method: ${method}`);
+      },
+    });
+    await plugin(bb);
+    const workspace = await harness.behavior.callRpc("workspace_create", {
+      name: "Authentication", description: "", instructions: "", repositories: [{ projectId: "proj_auth", alias: "identity" }],
+    }) as { id: string; revision: number };
+    await harness.behavior.callRpc("session_start", {
+      workspaceId: workspace.id, expectedRevision: workspace.revision, hostId: "host_local",
+      projectIds: ["proj_auth"], prompt: "Inspect the identity service.", requestKey: "reconciliation-session-1",
+    });
+
+    const dashboard = await harness.behavior.callRpc("dashboard", null) as { sessions: Array<{ threadId: string | null; error: string | null }> };
+    const sessionError = dashboard.sessions.find((session) => session.threadId === "thr_reconciliation")?.error;
+    expect(sessionError).toHaveLength(500);
+    expect(sessionError).toMatch(/^manifest unavailable x+/);
+    expect(sessionError).not.toMatch(/[\r\n]/);
+
+    const cli = await harness.behavior.runCli(["sessions"]);
+    expect(cli.stdout).toContain(`ERROR: ${sessionError}`);
+    expect(cli.stdout).not.toMatch(/[\r\n]/);
+  });
+
   it("prepares selected repos and launches one thread at the common root", async () => {
     const hostCalls: Array<{ method: string; input: unknown }> = [];
     const availableProjects = [...projects];

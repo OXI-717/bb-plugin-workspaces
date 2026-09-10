@@ -17,15 +17,16 @@ export type SessionExpansionDeps = {
 };
 export type AgentExpansionRequest = { threadId: string; alias: string; reason: string; requestKey: string; signal?: AbortSignal };
 export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string; reason?: string };
-export type ExpansionResult = { added: boolean; alias: string; policy: "ask" | "auto"; cancelled?: boolean; pending?: boolean; recovered?: boolean; error?: string };
+export type ExpansionResult = { added: boolean; alias: string; policy: "ask" | "auto"; session: SessionSnapshot; cancelled?: boolean; pending?: boolean; recovered?: boolean; error?: string };
 export type ActiveReconciliationResult = { sessionId: string; session?: SessionSnapshot; error?: string };
+type ExpansionIdentity = { projectId?: string; alias?: string };
 
 const requestKeySchema = z.string().min(8).max(200);
 const reasonSchema = z.string().min(1).max(2_000);
 
 /** Resolves untrusted requests and owns the complete expansion state machine. */
 export class SessionExpansionService {
-  private readonly inFlight = new Map<string, Promise<ExpansionResult>>();
+  private readonly inFlight = new Map<string, { identity: ExpansionIdentity; promise: Promise<ExpansionResult> }>();
 
   constructor(private readonly deps: SessionExpansionDeps) {}
 
@@ -38,13 +39,23 @@ export class SessionExpansionService {
   requestFromAgent(input: AgentExpansionRequest): Promise<ExpansionResult> {
     requestKeySchema.parse(input.requestKey);
     reasonSchema.parse(input.reason);
-    return this.runOnce(input.requestKey, () => this.requestFromAgentOnce(input));
+    try {
+      const session = this.sessionForThread(input.threadId);
+      return this.runOnce(session.id, input.requestKey, { alias: input.alias }, () => this.requestFromAgentOnce(session, input));
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   addManually(input: ManualExpansionRequest): Promise<ExpansionResult> {
     requestKeySchema.parse(input.requestKey);
     if (input.reason !== undefined) reasonSchema.parse(input.reason);
-    return this.runOnce(input.requestKey, () => this.addManuallyOnce(input));
+    try {
+      const session = this.sessionForThread(input.threadId);
+      return this.runOnce(session.id, input.requestKey, { projectId: input.projectId }, () => this.addManuallyOnce(session, input));
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   async reconcileSession(sessionId: string): Promise<SessionSnapshot> {
@@ -65,14 +76,13 @@ export class SessionExpansionService {
     return results;
   }
 
-  private async requestFromAgentOnce(input: AgentExpansionRequest): Promise<ExpansionResult> {
+  private async requestFromAgentOnce(session: SessionSnapshot, input: AgentExpansionRequest): Promise<ExpansionResult> {
     const replay = this.deps.store.getExpansionByRequestKey(input.requestKey);
-    if (replay) return this.replay(replay);
-    const session = this.sessionForThread(input.threadId);
+    if (replay) return this.replayForRequest(replay, session, { alias: input.alias });
     const option = (await this.optionsForSession(session)).find((candidate) => candidate.alias === input.alias);
     if (!option) throw new Error(`Repository alias ${input.alias} is not eligible for this session`);
     const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason, requester: "agent", approvalMode: "once", requestKey: input.requestKey });
-    if (!claim.claimed) return this.replay(claim.expansion);
+    if (!claim.claimed) return this.replayForRequest(claim.expansion, session, option);
     try {
       if (this.deps.store.getSession(session.id).expansionPolicy === "ask") {
         let response;
@@ -99,14 +109,13 @@ export class SessionExpansionService {
     }
   }
 
-  private async addManuallyOnce(input: ManualExpansionRequest): Promise<ExpansionResult> {
+  private async addManuallyOnce(session: SessionSnapshot, input: ManualExpansionRequest): Promise<ExpansionResult> {
     const replay = this.deps.store.getExpansionByRequestKey(input.requestKey);
-    if (replay) return this.replay(replay);
-    const session = this.sessionForThread(input.threadId);
+    if (replay) return this.replayForRequest(replay, session, { projectId: input.projectId });
     const option = (await this.optionsForSession(session)).find((candidate) => candidate.projectId === input.projectId);
     if (!option) throw new Error(`Project ${input.projectId} is not eligible for this session`);
     const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason ?? "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
-    if (!claim.claimed) return this.replay(claim.expansion);
+    if (!claim.claimed) return this.replayForRequest(claim.expansion, session, option);
     try {
       const result = await this.provision(session.id, option, input.requestKey);
       return result.pending ? result : this.terminal(result, session.id);
@@ -135,6 +144,16 @@ export class SessionExpansionService {
   private async replay(expansion: SessionExpansion): Promise<ExpansionResult> {
     if (expansion.outcome !== "pending") return this.resultForReplay(expansion);
     return this.recoverPending(expansion);
+  }
+
+  private replayForRequest(
+    expansion: SessionExpansion,
+    session: SessionSnapshot,
+    requested: ExpansionIdentity,
+  ): Promise<ExpansionResult> {
+    if (expansion.sessionId !== session.id) throw new Error(`Request key ${expansion.requestKey} belongs to a different session`);
+    this.assertSameIdentity(expansion.requestKey, expansion, requested);
+    return this.replay(expansion);
   }
 
   private async recoverDiskPresent(session: SessionSnapshot, option: ExpansionOption, requestKey: string, recordingError: unknown): Promise<ExpansionResult> {
@@ -219,15 +238,23 @@ export class SessionExpansionService {
     });
   }
 
-  private success(sessionId: string, alias: string): ExpansionResult { return { added: true, alias, policy: this.deps.store.getSession(sessionId).expansionPolicy }; }
-  private pending(sessionId: string, alias: string, error?: string): ExpansionResult { return { added: false, alias, policy: this.deps.store.getSession(sessionId).expansionPolicy, pending: true, ...(error ? { error } : {}) }; }
+  private success(sessionId: string, alias: string): ExpansionResult {
+    const session = this.deps.store.getSession(sessionId);
+    return { added: true, alias, policy: session.expansionPolicy, session };
+  }
+  private pending(sessionId: string, alias: string, error?: string): ExpansionResult {
+    const session = this.deps.store.getSession(sessionId);
+    return { added: false, alias, policy: session.expansionPolicy, session, pending: true, ...(error ? { error } : {}) };
+  }
   private cancel(requestKey: string, alias: string): ExpansionResult {
     const expansion = this.deps.store.finishExpansion(requestKey, "cancelled");
-    return { added: false, alias, policy: this.deps.store.getSession(expansion.sessionId).expansionPolicy, cancelled: true };
+    const session = this.deps.store.getSession(expansion.sessionId);
+    return { added: false, alias, policy: session.expansionPolicy, session, cancelled: true };
   }
   private fail(requestKey: string, alias: string, error: unknown): ExpansionResult {
     const expansion = this.deps.store.finishExpansion(requestKey, "failed", this.message(error));
-    return { added: false, alias, policy: this.deps.store.getSession(expansion.sessionId).expansionPolicy, error: this.message(error) };
+    const session = this.deps.store.getSession(expansion.sessionId);
+    return { added: false, alias, policy: session.expansionPolicy, session, error: this.message(error) };
   }
   private async terminal(result: ExpansionResult, sessionId: string): Promise<ExpansionResult> {
     try {
@@ -238,21 +265,33 @@ export class SessionExpansionService {
     return result;
   }
   private resultForReplay(expansion: SessionExpansion): ExpansionResult {
-    const policy = this.deps.store.getSession(expansion.sessionId).expansionPolicy;
-    if (expansion.outcome === "provisioned") return { added: true, alias: expansion.alias, policy };
-    if (expansion.outcome === "cancelled") return { added: false, alias: expansion.alias, policy, cancelled: true };
-    return { added: false, alias: expansion.alias, policy, error: expansion.error ?? "Expansion failed" };
+    const session = this.deps.store.getSession(expansion.sessionId);
+    if (expansion.outcome === "provisioned") return { added: true, alias: expansion.alias, policy: session.expansionPolicy, session };
+    if (expansion.outcome === "cancelled") return { added: false, alias: expansion.alias, policy: session.expansionPolicy, session, cancelled: true };
+    return { added: false, alias: expansion.alias, policy: session.expansionPolicy, session, error: expansion.error ?? "Expansion failed" };
   }
-  private runOnce(requestKey: string, operation: () => Promise<ExpansionResult>): Promise<ExpansionResult> {
-    const existing = this.inFlight.get(requestKey);
-    if (existing) return existing;
+  private runOnce(sessionId: string, requestKey: string, identity: ExpansionIdentity, operation: () => Promise<ExpansionResult>): Promise<ExpansionResult> {
+    const inFlightKey = `${sessionId}\u0000${requestKey}`;
+    const existing = this.inFlight.get(inFlightKey);
+    if (existing) {
+      this.assertSameIdentity(requestKey, existing.identity, identity);
+      return existing.promise;
+    }
     const promise = operation();
-    this.inFlight.set(requestKey, promise);
+    this.inFlight.set(inFlightKey, { identity, promise });
     void promise.then(
-      () => { if (this.inFlight.get(requestKey) === promise) this.inFlight.delete(requestKey); },
-      () => { if (this.inFlight.get(requestKey) === promise) this.inFlight.delete(requestKey); },
+      () => { if (this.inFlight.get(inFlightKey)?.promise === promise) this.inFlight.delete(inFlightKey); },
+      () => { if (this.inFlight.get(inFlightKey)?.promise === promise) this.inFlight.delete(inFlightKey); },
     );
     return promise;
+  }
+  private assertSameIdentity(requestKey: string, actual: ExpansionIdentity, requested: ExpansionIdentity): void {
+    if (requested.projectId && actual.projectId !== requested.projectId) {
+      throw new Error(`Request key ${requestKey} belongs to a different project`);
+    }
+    if (requested.alias && actual.alias !== requested.alias) {
+      throw new Error(`Request key ${requestKey} belongs to a different alias`);
+    }
   }
   private isAbort(error: unknown): boolean { return error instanceof Error && error.name === "AbortError"; }
   private message(error: unknown): string { return error instanceof Error ? error.message : String(error); }

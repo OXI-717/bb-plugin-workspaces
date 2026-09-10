@@ -81,6 +81,28 @@ function createFixture(options: { policy?: "ask" | "auto"; projects?: Project[];
   return { db, store, session, workspace, deps, approvals, hostAdds, publications, projects };
 }
 
+function addWorkersRepository(fixture: ReturnType<typeof createFixture>) {
+  fixture.projects.push(project("proj_workers", "Workers"));
+  const workspace = fixture.store.get(fixture.workspace.id);
+  fixture.store.update(workspace.id, workspace.revision, {
+    name: workspace.name,
+    description: workspace.description,
+    instructions: workspace.instructions,
+    repositories: [
+      ...workspace.repositories.map(({ projectId, alias }) => ({ projectId, alias })),
+      { projectId: "proj_workers", alias: "workers" },
+    ],
+  });
+}
+
+function addSecondActiveSession(fixture: ReturnType<typeof createFixture>) {
+  const workspace = fixture.store.get(fixture.workspace.id);
+  const session = fixture.store.createSessionSnapshot(
+    workspace.id, workspace.revision, [{ projectId: "proj_api", alias: "api" }], "second-session-1",
+  );
+  return fixture.store.updateSession(session.id, { state: "active", hostId: "host_1", threadId: "thr_2" });
+}
+
 describe("SessionExpansionService", () => {
   it("asks then adds once through the trusted option", async () => {
     const fixture = createFixture();
@@ -274,12 +296,76 @@ describe("SessionExpansionService", () => {
     expect(fixture.approvals).toHaveLength(1);
     decide({ action: "add-once" });
 
-    await expect(Promise.all([first, second])).resolves.toEqual([
-      { added: true, alias: "audits", policy: "ask" },
-      { added: true, alias: "audits", policy: "ask" },
+    await expect(Promise.all([first, second])).resolves.toMatchObject([
+      { added: true, alias: "audits", policy: "ask", session: { id: fixture.session.id } },
+      { added: true, alias: "audits", policy: "ask", session: { id: fixture.session.id } },
     ]);
     expect(fixture.hostAdds).toHaveLength(1);
     expect(fixture.publications).toHaveLength(1);
+  });
+
+  it("rejects sequential manual request-key reuse across sessions or repositories", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    addWorkersRepository(fixture);
+    addSecondActiveSession(fixture);
+    const service = new SessionExpansionService(fixture.deps);
+
+    await service.addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey: "manual-collision-1" });
+    await expect(service.addManually({ threadId: "thr_2", projectId: "proj_audits", requestKey: "manual-collision-1" }))
+      .rejects.toThrow(/different session/i);
+    await expect(service.addManually({ threadId: "thr_1", projectId: "proj_workers", requestKey: "manual-collision-1" }))
+      .rejects.toThrow(/different project/i);
+    expect(fixture.hostAdds).toHaveLength(1);
+  });
+
+  it("does not combine concurrent manual request-key collisions", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    addWorkersRepository(fixture);
+    addSecondActiveSession(fixture);
+    const service = new SessionExpansionService(fixture.deps);
+
+    const results = await Promise.allSettled([
+      service.addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey: "manual-race-key-1" }),
+      service.addManually({ threadId: "thr_2", projectId: "proj_audits", requestKey: "manual-race-key-1" }),
+      service.addManually({ threadId: "thr_1", projectId: "proj_workers", requestKey: "manual-race-key-1" }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected").map((result) => String((result as PromiseRejectedResult).reason)))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/different session/i), expect.stringMatching(/different project/i)]));
+    expect(fixture.hostAdds).toHaveLength(1);
+  });
+
+  it("rejects sequential agent request-key reuse across sessions or aliases", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    addWorkersRepository(fixture);
+    addSecondActiveSession(fixture);
+    const service = new SessionExpansionService(fixture.deps);
+
+    await service.requestFromAgent({ threadId: "thr_1", alias: "audits", reason: "Need audit contracts.", requestKey: "agent-collision-1" });
+    await expect(service.requestFromAgent({ threadId: "thr_2", alias: "audits", reason: "Need audit contracts.", requestKey: "agent-collision-1" }))
+      .rejects.toThrow(/different session/i);
+    await expect(service.requestFromAgent({ threadId: "thr_1", alias: "workers", reason: "Need worker contracts.", requestKey: "agent-collision-1" }))
+      .rejects.toThrow(/different alias/i);
+    expect(fixture.hostAdds).toHaveLength(1);
+  });
+
+  it("does not combine concurrent agent request-key collisions", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    addWorkersRepository(fixture);
+    addSecondActiveSession(fixture);
+    const service = new SessionExpansionService(fixture.deps);
+
+    const results = await Promise.allSettled([
+      service.requestFromAgent({ threadId: "thr_1", alias: "audits", reason: "Need audit contracts.", requestKey: "agent-race-key-1" }),
+      service.requestFromAgent({ threadId: "thr_2", alias: "audits", reason: "Need audit contracts.", requestKey: "agent-race-key-1" }),
+      service.requestFromAgent({ threadId: "thr_1", alias: "workers", reason: "Need worker contracts.", requestKey: "agent-race-key-1" }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected").map((result) => String((result as PromiseRejectedResult).reason)))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/different session/i), expect.stringMatching(/different alias/i)]));
+    expect(fixture.hostAdds).toHaveLength(1);
   });
 
   it("keeps disk-present expansion pending until a replay repairs its matching manifest operation", async () => {
