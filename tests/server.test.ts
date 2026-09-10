@@ -72,16 +72,42 @@ describe("Workspaces plugin server", () => {
 
   it("prepares selected repos and launches one thread at the common root", async () => {
     const hostCalls: Array<{ method: string; input: unknown }> = [];
+    const availableProjects = [...projects];
     const { bb, harness } = createFakePluginHost({
       pluginId: "workspaces",
       sdk: {
-        projects: { list: async () => projects },
+        projects: {
+          list: async () => availableProjects,
+          create: async ({ name, source }) => {
+            const created = {
+              id: "proj_workspaces",
+              kind: "standard" as const,
+              name,
+              gitRemoteUrl: "https://example.invalid/workspaces.git",
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [{
+                id: "src_workspaces",
+                projectId: "proj_workspaces",
+                type: "local_path" as const,
+                hostId: source.hostId,
+                path: source.path,
+                isDefault: true,
+                createdAt: 1,
+                updatedAt: 1,
+              }],
+            };
+            availableProjects.push(created);
+            return created;
+          },
+        },
         threads: { spawn: async () => makeThreadResponse({ id: "thr_multi", projectId: "proj_auth" }) },
       },
       experimental_hostEntry: true,
       experimental_callHostRpc: async ({ method, input }) => {
         hostCalls.push({ method, input });
         if (method === "cleanup_session") return { cleaned: true };
+        if (method === "ensure_anchor") return { path: "/plugin/anchor" };
         if (method !== "prepare_session") throw new Error(`Unexpected host method: ${method}`);
         const request = input as {
           sessionId: string;
@@ -129,11 +155,11 @@ describe("Workspaces plugin server", () => {
     expect(session).toMatchObject({
       state: "active",
       threadId: "thr_multi",
-      ownerProjectId: "proj_auth",
+      ownerProjectId: "proj_workspaces",
       rootPath: expect.stringContaining("/sessions/"),
     });
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
-      projectId: "proj_auth",
+      projectId: "proj_workspaces",
       prompt: "Change the auth contract in both services.",
       title: "🧩 Authentication · Change the auth contract in both services.",
       environment: {
@@ -145,6 +171,21 @@ describe("Workspaces plugin server", () => {
     expect(retried.id).toBe(session.id);
     expect(hostCalls.filter((call) => call.method === "prepare_session")).toHaveLength(1);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect((await harness.behavior.callRpc("dashboard", null) as { projects: Array<{ id: string }> }).projects
+      .map((project) => project.id)).toEqual(["proj_auth", "proj_gateway"]);
+    await expect(harness.behavior.callRpc("workspace_update", {
+      id: workspace.id,
+      expectedRevision: workspace.revision,
+      draft: {
+        name: "Authentication",
+        description: "",
+        instructions: "Read each repo's AGENTS.md.",
+        repositories: [
+          { projectId: "proj_auth", alias: "identity" },
+          { projectId: "proj_workspaces", alias: "workspaces" },
+        ],
+      },
+    })).rejects.toThrow("cannot be added to a workspace");
 
     await harness.behavior.callRpc("session_archive", { id: session.id });
     const cleaned = await harness.behavior.callRpc("session_cleanup", { id: session.id });

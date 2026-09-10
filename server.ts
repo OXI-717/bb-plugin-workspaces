@@ -3,6 +3,7 @@ import { z } from "zod";
 import { workspaceDraftSchema } from "./src/contracts";
 import { hostContract } from "./src/host-contract";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "./src/store";
+import { ensureWorkspaceProject, type ProjectRecord } from "./src/workspace-project";
 
 const repositorySchema = z.object({ projectId: z.string(), alias: z.string(), ordinal: z.number().int() });
 const workspaceSchema = z.object({
@@ -68,7 +69,15 @@ export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
   const changed = () => bb.realtime.publish(WORKSPACES_CHANGED, { at: Date.now() });
 
-  async function projects() {
+  function toProjectRecord(project: Awaited<ReturnType<typeof bb.sdk.projects.create>>): ProjectRecord {
+    return {
+      id: project.id,
+      name: project.name,
+      sources: project.sources.map((source) => ({ id: source.id, hostId: source.hostId, path: source.path, isDefault: source.isDefault })),
+    };
+  }
+
+  async function allProjects() {
     const rows = await bb.sdk.projects.list();
     return rows.map((project) => ({
       id: project.id, name: project.name, gitRemoteUrl: project.gitRemoteUrl,
@@ -76,14 +85,49 @@ export default async function plugin(bb: BbPluginApi) {
     }));
   }
 
+  async function projects() {
+    const workspaceProjectId = store.getWorkspaceProjectId();
+    return (await allProjects()).filter((project) => project.id !== workspaceProjectId);
+  }
+
+  async function assertWorkspaceMembership(draft: { repositories: Array<{ projectId: string }> }) {
+    const workspaceProjectId = store.getWorkspaceProjectId();
+    if (workspaceProjectId && draft.repositories.some((repository) => repository.projectId === workspaceProjectId)) {
+      throw new Error("The synthetic Workspaces project cannot be added to a workspace");
+    }
+    const projectIds = new Set((await projects()).map((project) => project.id));
+    for (const repository of draft.repositories) {
+      if (!projectIds.has(repository.projectId)) throw new Error(`BB project ${repository.projectId} was not found`);
+    }
+  }
+
+  const workspaceProjectDeps = {
+    getStoredProjectId: () => store.getWorkspaceProjectId(),
+    setStoredProjectId: (id: string) => store.setWorkspaceProjectId(id),
+    ensureAnchor: (hostId: string) => host.call("ensure_anchor", {}, { hostId }),
+    getProject: async (id: string) => {
+      try {
+        return toProjectRecord(await bb.sdk.projects.get({ projectId: id }));
+      } catch {
+        return null;
+      }
+    },
+    listProjects: async () => (await allProjects()).map((project) => ({ id: project.id, name: project.name, sources: project.sources })),
+    createProject: async (input: { name: string; source: { type: "local_path"; hostId: string; path: string } }) => toProjectRecord(await bb.sdk.projects.create(input)),
+    addSource: async (projectId: string, input: { type: "local_path"; hostId: string; path: string }) => { await bb.sdk.projects.sources.add({ projectId, ...input }); },
+  };
+
+  async function workspaceProject(hostId: string): Promise<string> {
+    return ensureWorkspaceProject(workspaceProjectDeps, hostId);
+  }
+
   bb.rpc.register(rpcContract, {
     dashboard: async () => ({ workspaces: store.list(true), sessions: store.listSessions(), projects: await projects() }),
     workspace_create: async (draft) => {
-      const projectIds = new Set((await projects()).map((project) => project.id));
-      for (const repository of draft.repositories) if (!projectIds.has(repository.projectId)) throw new Error(`BB project ${repository.projectId} was not found`);
+      await assertWorkspaceMembership(draft);
       const workspace = store.create(draft); changed(); return workspace;
     },
-    workspace_update: async ({ id, expectedRevision, draft }) => { const workspace = store.update(id, expectedRevision, draft); changed(); return workspace; },
+    workspace_update: async ({ id, expectedRevision, draft }) => { await assertWorkspaceMembership(draft); const workspace = store.update(id, expectedRevision, draft); changed(); return workspace; },
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
@@ -96,8 +140,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (selectedSet.size !== projectIds.length) throw new Error("Select each repository only once");
       const selected = workspace.repositories.filter((repository) => selectedSet.has(repository.projectId));
       if (selected.length !== selectedSet.size) throw new Error("One or more selected projects are not in this workspace");
-      const primaryProjectId = selected[0]!.projectId;
-      const available = new Map((await projects()).map((project) => [project.id, project]));
+      const ownerProjectId = store.getWorkspaceProjectId();
+      if (ownerProjectId && selected.some((repository) => repository.projectId === ownerProjectId)) {
+        throw new Error("The synthetic Workspaces project cannot be selected as a repository");
+      }
+      const available = new Map((await allProjects()).map((project) => [project.id, project]));
       const resolved = selected.map((repository) => {
         const project = available.get(repository.projectId);
         if (!project) throw new Error(`BB project ${repository.projectId} was not found`);
@@ -106,8 +153,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (!source) throw new Error(`${project.name} has no source on the selected host`);
         return { ...repository, sourceId: source.id, sourcePath: source.path, baseRef: "HEAD" };
       });
+      const workspaceOwnerProjectId = await workspaceProject(hostId);
       let session = store.createSessionSnapshot(workspaceId, expectedRevision, selected, requestKey);
-      session = store.updateSession(session.id, { state: "preparing", hostId, primaryProjectId, error: null });
+      session = store.updateSession(session.id, { state: "preparing", hostId, ownerProjectId: workspaceOwnerProjectId, error: null });
       changed();
       try {
         const prepared = await host.call("prepare_session", {
@@ -122,7 +170,7 @@ export default async function plugin(bb: BbPluginApi) {
         })));
         session = store.updateSession(session.id, { rootPath: prepared.rootPath });
         const thread = await bb.sdk.threads.spawn({
-          projectId: primaryProjectId,
+          projectId: workspaceOwnerProjectId,
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: prepared.rootPath } },
           prompt, title: `🧩 ${workspace.name} · ${prompt.slice(0, 72)}`, visibility: "visible",
         });

@@ -145,6 +145,8 @@ export const WORKSPACE_MIGRATIONS = [`
   WHERE outcome = 'provisioned';
 `];
 
+const WORKSPACE_PROJECT_ID_METADATA_KEY = "workspace-project-id";
+
 export class WorkspaceStore {
   constructor(private readonly db: Database.Database) {
     this.db.pragma("foreign_keys = ON");
@@ -255,6 +257,14 @@ export class WorkspaceStore {
   setMetadata(key: string, value: string): void {
     this.db.prepare(`INSERT INTO plugin_metadata (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+  }
+
+  getWorkspaceProjectId(): string | null {
+    return this.getMetadata(WORKSPACE_PROJECT_ID_METADATA_KEY);
+  }
+
+  setWorkspaceProjectId(id: string): void {
+    this.setMetadata(WORKSPACE_PROJECT_ID_METADATA_KEY, id);
   }
 
   getSession(id: string): SessionSnapshot {
