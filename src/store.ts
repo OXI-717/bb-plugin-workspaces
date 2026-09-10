@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
   workspaceDraftSchema,
+  type ExpansionApprovalMode,
+  type ExpansionOutcome,
+  type ExpansionPolicy,
+  type ExpansionRequester,
   type RepositoryDraft,
+  type SessionExpansion,
   type SessionRepository,
   type SessionSnapshot,
   type Workspace,
@@ -34,11 +39,46 @@ type SessionRow = {
   host_id: string | null;
   root_path: string | null;
   primary_project_id: string | null;
+  initial_repositories_json: string | null;
+  expansion_policy: ExpansionPolicy | null;
+  manifest_revision: number | null;
   thread_id: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
   request_key: string;
+};
+
+type ExpansionRow = {
+  id: string;
+  session_id: string;
+  project_id: string;
+  alias: string;
+  reason: string;
+  requester: ExpansionRequester;
+  approval_mode: ExpansionApprovalMode;
+  outcome: ExpansionOutcome;
+  request_key: string;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type BeginExpansionInput = {
+  sessionId: string;
+  projectId: string;
+  alias: string;
+  reason: string;
+  requester: ExpansionRequester;
+  approvalMode: ExpansionApprovalMode;
+  requestKey: string;
+};
+
+export type AppendProvisionedRepositoryInput = {
+  sessionId: string;
+  requestKey: string;
+  repository: SessionRepository;
+  manifestRevision: number;
 };
 
 export const WORKSPACE_MIGRATIONS = [`
@@ -78,12 +118,36 @@ export const WORKSPACE_MIGRATIONS = [`
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+`, `
+  ALTER TABLE sessions ADD COLUMN initial_repositories_json TEXT;
+  ALTER TABLE sessions ADD COLUMN expansion_policy TEXT NOT NULL DEFAULT 'ask';
+  ALTER TABLE sessions ADD COLUMN manifest_revision INTEGER NOT NULL DEFAULT 1;
+  CREATE TABLE IF NOT EXISTS plugin_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS session_expansions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requester TEXT NOT NULL,
+    approval_mode TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    request_key TEXT NOT NULL UNIQUE,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS session_expansions_provisioned_repo
+  ON session_expansions(session_id, project_id)
+  WHERE outcome = 'provisioned';
 `];
 
 export class WorkspaceStore {
   constructor(private readonly db: Database.Database) {
     this.db.pragma("foreign_keys = ON");
-    this.db.exec(WORKSPACE_MIGRATIONS[0]!);
   }
 
   list(includeArchived = false): Workspace[] {
@@ -141,6 +205,8 @@ export class WorkspaceStore {
   }
 
   createSessionSnapshot(workspaceId: string, expectedRevision: number, repositories: RepositoryDraft[], requestKey: string = randomUUID()): SessionSnapshot {
+    const existing = this.getSessionByRequestKey(requestKey);
+    if (existing) return existing;
     const workspace = this.get(workspaceId);
     if (workspace.revision !== expectedRevision) throw new Error("Workspace revision is stale");
     const allowed = new Map(workspace.repositories.map((repository) => [repository.projectId, repository.alias]));
@@ -151,19 +217,44 @@ export class WorkspaceStore {
       }
       return repository;
     });
-    const now = Date.now();
-    const id = `session_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-    this.db.prepare(`INSERT INTO sessions
-      (id, workspace_id, workspace_name, workspace_revision, instructions, repositories_json,
-       state, request_key, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`)
-      .run(id, workspace.id, workspace.name, workspace.revision, workspace.instructions, JSON.stringify(selected), requestKey, now, now);
+    const id = this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT id FROM sessions WHERE request_key = ?").get(requestKey) as Pick<SessionRow, "id"> | undefined;
+      if (existing) return existing.id;
+      const now = Date.now();
+      const id = `session_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const repositoriesJson = JSON.stringify(selected);
+      this.db.prepare(`INSERT INTO sessions
+        (id, workspace_id, workspace_name, workspace_revision, instructions, repositories_json, initial_repositories_json,
+         state, request_key, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`)
+        .run(id, workspace.id, workspace.name, workspace.revision, workspace.instructions, repositoriesJson, repositoriesJson, requestKey, now, now);
+      return id;
+    })();
     return this.getSession(id);
   }
 
   getSessionByRequestKey(requestKey: string): SessionSnapshot | null {
     const row = this.db.prepare("SELECT * FROM sessions WHERE request_key = ?").get(requestKey) as SessionRow | undefined;
     return row ? this.hydrateSession(row) : null;
+  }
+
+  getSessionByThreadId(threadId: string): SessionSnapshot | null {
+    const row = this.db.prepare("SELECT * FROM sessions WHERE thread_id = ?").get(threadId) as SessionRow | undefined;
+    return row ? this.hydrateSession(row) : null;
+  }
+
+  hasSessionForThread(threadId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM sessions WHERE thread_id = ?").get(threadId) !== undefined;
+  }
+
+  getMetadata(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM plugin_metadata WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setMetadata(key: string, value: string): void {
+    this.db.prepare(`INSERT INTO plugin_metadata (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
   }
 
   getSession(id: string): SessionSnapshot {
@@ -179,20 +270,94 @@ export class WorkspaceStore {
     return rows.map((row) => this.hydrateSession(row));
   }
 
-  updateSession(id: string, patch: Partial<Pick<SessionSnapshot, "state" | "hostId" | "rootPath" | "primaryProjectId" | "threadId" | "error">>): SessionSnapshot {
+  updateSession(
+    id: string,
+    patch: Partial<Pick<SessionSnapshot, "state" | "hostId" | "rootPath" | "ownerProjectId" | "threadId" | "error">> & { primaryProjectId?: string | null },
+  ): SessionSnapshot {
     const current = this.getSession(id);
-    const next = { ...current, ...patch, updatedAt: Date.now() };
+    const ownerProjectId = patch.ownerProjectId ?? patch.primaryProjectId ?? current.ownerProjectId;
+    const next = { ...current, ...patch, ownerProjectId, updatedAt: Date.now() };
     this.db.prepare(`UPDATE sessions SET state = ?, host_id = ?, root_path = ?, primary_project_id = ?,
       thread_id = ?, error = ?, updated_at = ? WHERE id = ?`)
-      .run(next.state, next.hostId, next.rootPath, next.primaryProjectId, next.threadId, next.error, next.updatedAt, id);
+      .run(next.state, next.hostId, next.rootPath, next.ownerProjectId, next.threadId, next.error, next.updatedAt, id);
     return this.getSession(id);
   }
 
+  /** @deprecated Retained for launch compatibility; it cannot remove or rename existing members. */
   setSessionRepositories(id: string, repositories: SessionRepository[]): SessionSnapshot {
-    const result = this.db.prepare("UPDATE sessions SET repositories_json = ?, updated_at = ? WHERE id = ?")
-      .run(JSON.stringify(repositories), Date.now(), id);
+    return this.reconcileRepositories(id, repositories, this.getSession(id).manifestRevision);
+  }
+
+  setExpansionPolicy(id: string, policy: ExpansionPolicy): SessionSnapshot {
+    const result = this.db.prepare("UPDATE sessions SET expansion_policy = ?, updated_at = ? WHERE id = ?")
+      .run(policy, Date.now(), id);
     if (result.changes !== 1) throw new Error(`Session ${id} was not found`);
     return this.getSession(id);
+  }
+
+  beginExpansion(input: BeginExpansionInput): SessionExpansion {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(input.requestKey) as ExpansionRow | undefined;
+      if (existing) return this.hydrateExpansion(existing);
+      this.getSession(input.sessionId);
+      const now = Date.now();
+      const id = `expansion_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      this.db.prepare(`INSERT INTO session_expansions
+        (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`)
+        .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now);
+      return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE id = ?").get(id) as ExpansionRow);
+    })();
+  }
+
+  finishExpansion(requestKey: string, outcome: "cancelled" | "failed", error?: string): SessionExpansion {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow | undefined;
+      if (!existing) throw new Error(`Expansion ${requestKey} was not found`);
+      if (existing.outcome !== "pending") return this.hydrateExpansion(existing);
+      const now = Date.now();
+      this.db.prepare("UPDATE session_expansions SET outcome = ?, error = ?, updated_at = ? WHERE request_key = ?")
+        .run(outcome, error ?? null, now, requestKey);
+      return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow);
+    })();
+  }
+
+  appendProvisionedRepository(input: AppendProvisionedRepositoryInput): SessionSnapshot {
+    this.db.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(input.sessionId) as SessionRow | undefined;
+      if (!row) throw new Error(`Session ${input.sessionId} was not found`);
+      if (input.manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
+      const expansion = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(input.requestKey) as ExpansionRow | undefined;
+      if (!expansion || expansion.session_id !== input.sessionId) throw new Error(`Expansion ${input.requestKey} was not found for session ${input.sessionId}`);
+      if (expansion.project_id !== input.repository.projectId || expansion.alias !== input.repository.alias) {
+        throw new Error("Provisioned repository does not match its expansion request");
+      }
+      if (expansion.outcome !== "pending" && expansion.outcome !== "provisioned") throw new Error("Expansion is no longer pending");
+      if (expansion.outcome === "provisioned") return;
+      const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
+      const existing = repositories.find((repository) => repository.projectId === input.repository.projectId);
+      if (existing && existing.alias !== input.repository.alias) throw new Error("Cannot replace an existing session repository");
+      const nextRepositories = existing ? repositories : [...repositories, input.repository];
+      const now = Date.now();
+      this.db.prepare(`UPDATE sessions SET repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?`)
+        .run(JSON.stringify(nextRepositories), input.manifestRevision, now, input.sessionId);
+      this.db.prepare(`UPDATE session_expansions SET outcome = 'provisioned', error = NULL, updated_at = ? WHERE request_key = ?`)
+        .run(now, input.requestKey);
+    })();
+    return this.getSession(input.sessionId);
+  }
+
+  reconcileRepositories(sessionId: string, repositories: SessionRepository[], manifestRevision: number): SessionSnapshot {
+    this.db.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as SessionRow | undefined;
+      if (!row) throw new Error(`Session ${sessionId} was not found`);
+      if (manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
+      const current = JSON.parse(row.repositories_json) as SessionRepository[];
+      this.assertAppendOnlyMembership(current, repositories);
+      this.db.prepare("UPDATE sessions SET repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(repositories), manifestRevision, Date.now(), sessionId);
+    })();
+    return this.getSession(sessionId);
   }
 
   private replaceRepositories(workspaceId: string, repositories: RepositoryDraft[]): void {
@@ -230,21 +395,63 @@ export class WorkspaceStore {
   }
 
   private hydrateSession(row: SessionRow): SessionSnapshot {
+    const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
     return {
       id: row.id,
       workspaceId: row.workspace_id,
       workspaceName: row.workspace_name,
       workspaceRevision: row.workspace_revision,
       instructions: row.instructions,
-      repositories: JSON.parse(row.repositories_json) as SessionRepository[],
+      repositories,
+      initialRepositories: row.initial_repositories_json
+        ? JSON.parse(row.initial_repositories_json) as SessionRepository[]
+        : repositories,
+      expansionPolicy: row.expansion_policy ?? "ask",
+      expansions: (this.db.prepare("SELECT * FROM session_expansions WHERE session_id = ? ORDER BY created_at, id").all(row.id) as ExpansionRow[])
+        .map((expansion) => this.hydrateExpansion(expansion)),
+      manifestRevision: row.manifest_revision ?? 1,
       state: row.state,
       hostId: row.host_id,
       rootPath: row.root_path,
-      primaryProjectId: row.primary_project_id,
+      ownerProjectId: row.primary_project_id,
       threadId: row.thread_id,
       error: row.error,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  private hydrateExpansion(row: ExpansionRow): SessionExpansion {
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      projectId: row.project_id,
+      alias: row.alias,
+      reason: row.reason,
+      requester: row.requester,
+      approvalMode: row.approval_mode,
+      outcome: row.outcome,
+      requestKey: row.request_key,
+      error: row.error,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private assertAppendOnlyMembership(current: SessionRepository[], proposed: SessionRepository[]): void {
+    const proposedByProject = new Map<string, SessionRepository>();
+    const aliases = new Set<string>();
+    for (const repository of proposed) {
+      if (proposedByProject.has(repository.projectId) || aliases.has(repository.alias)) {
+        throw new Error("Session repository manifest contains duplicate members");
+      }
+      proposedByProject.set(repository.projectId, repository);
+      aliases.add(repository.alias);
+    }
+    for (const repository of current) {
+      const replacement = proposedByProject.get(repository.projectId);
+      if (!replacement) throw new Error("Cannot remove an existing session repository");
+      if (replacement.alias !== repository.alias) throw new Error("Cannot replace an existing session repository");
+    }
   }
 }

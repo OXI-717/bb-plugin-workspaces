@@ -49,6 +49,26 @@ export type SessionRepository = RepositoryDraft & {
   worktreePath?: string;
 };
 
+export type ExpansionPolicy = "ask" | "auto";
+export type ExpansionRequester = "agent" | "user" | "reconcile";
+export type ExpansionApprovalMode = "once" | "auto" | "manual" | "reconciled";
+export type ExpansionOutcome = "pending" | "cancelled" | "failed" | "provisioned";
+
+export type SessionExpansion = {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  alias: string;
+  reason: string;
+  requester: ExpansionRequester;
+  approvalMode: ExpansionApprovalMode;
+  outcome: ExpansionOutcome;
+  requestKey: string;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type SessionSnapshot = {
   id: string;
   workspaceId: string | null;
@@ -56,10 +76,14 @@ export type SessionSnapshot = {
   workspaceRevision: number;
   instructions: string;
   repositories: SessionRepository[];
+  initialRepositories: SessionRepository[];
+  expansionPolicy: ExpansionPolicy;
+  expansions: SessionExpansion[];
+  manifestRevision: number;
   state: "draft" | "preparing" | "active" | "failed" | "archived" | "cleaned";
   hostId: string | null;
   rootPath: string | null;
-  primaryProjectId: string | null;
+  ownerProjectId: string | null;
   threadId: string | null;
   error: string | null;
   createdAt: number;

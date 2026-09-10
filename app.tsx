@@ -27,7 +27,7 @@ function useDashboard() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(() => {
-    rpc.call("dashboard").then((result) => { setDashboard(result as Dashboard); setError(null); }, (cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+    rpc.call("dashboard").then((result) => { setDashboard(result); setError(null); }, (cause) => setError(cause instanceof Error ? cause.message : String(cause)));
   }, [rpc]);
   useEffect(load, [load]);
   useRealtime("workspaces-changed", load);

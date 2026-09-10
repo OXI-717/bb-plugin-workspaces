@@ -129,7 +129,7 @@ describe("Workspaces plugin server", () => {
     expect(session).toMatchObject({
       state: "active",
       threadId: "thr_multi",
-      primaryProjectId: "proj_auth",
+      ownerProjectId: "proj_auth",
       rootPath: expect.stringContaining("/sessions/"),
     });
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({

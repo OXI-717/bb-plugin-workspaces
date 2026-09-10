@@ -14,11 +14,18 @@ const sessionRepositorySchema = z.object({
   projectId: z.string(), alias: z.string(), sourceId: z.string().optional(), sourcePath: z.string().optional(),
   baseRef: z.string().optional(), baseCommit: z.string().optional(), branch: z.string().optional(), worktreePath: z.string().optional(),
 });
+const sessionExpansionSchema = z.object({
+  id: z.string(), sessionId: z.string(), projectId: z.string(), alias: z.string(), reason: z.string(),
+  requester: z.enum(["agent", "user", "reconcile"]), approvalMode: z.enum(["once", "auto", "manual", "reconciled"]),
+  outcome: z.enum(["pending", "cancelled", "failed", "provisioned"]), requestKey: z.string(), error: z.string().nullable(),
+  createdAt: z.number().int(), updatedAt: z.number().int(),
+});
 const sessionSchema = z.object({
   id: z.string(), workspaceId: z.string().nullable(), workspaceName: z.string(), workspaceRevision: z.number().int(),
-  instructions: z.string(), repositories: z.array(sessionRepositorySchema),
+  instructions: z.string(), repositories: z.array(sessionRepositorySchema), initialRepositories: z.array(sessionRepositorySchema),
+  expansionPolicy: z.enum(["ask", "auto"]), expansions: z.array(sessionExpansionSchema), manifestRevision: z.number().int(),
   state: z.enum(["draft", "preparing", "active", "failed", "archived", "cleaned"]),
-  hostId: z.string().nullable(), rootPath: z.string().nullable(), primaryProjectId: z.string().nullable(),
+  hostId: z.string().nullable(), rootPath: z.string().nullable(), ownerProjectId: z.string().nullable(),
   threadId: z.string().nullable(), error: z.string().nullable(), createdAt: z.number(), updatedAt: z.number(),
 });
 const projectSchema = z.object({
