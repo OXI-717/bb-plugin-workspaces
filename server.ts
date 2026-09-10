@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { workspaceDraftSchema } from "./src/contracts";
+import { expansionApprovalResponseSchema, workspaceDraftSchema } from "./src/contracts";
 import { hostContract } from "./src/host-contract";
+import { SessionExpansionService, type ExpansionResult } from "./src/session-expansion";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "./src/store";
 import { ensureWorkspaceProject, type ProjectRecord } from "./src/workspace-project";
 
@@ -33,6 +35,13 @@ const projectSchema = z.object({
   id: z.string(), name: z.string(), gitRemoteUrl: z.string().nullable(),
   sources: z.array(z.object({ id: z.string(), hostId: z.string(), path: z.string(), isDefault: z.boolean() })),
 });
+const expansionOptionSchema = z.object({
+  projectId: z.string(), alias: z.string(), projectName: z.string(), sourcePath: z.string(),
+}).strict();
+const expansionResultSchema = z.object({
+  added: z.boolean(), alias: z.string(), worktreePath: z.string().nullable(),
+  policy: z.enum(["ask", "auto"]), session: sessionSchema,
+}).strict();
 
 export const rpcContract = defineRpcContract({
   dashboard: { input: z.null(), output: z.object({ workspaces: z.array(workspaceSchema), sessions: z.array(sessionSchema), projects: z.array(projectSchema) }) },
@@ -57,6 +66,16 @@ export const rpcContract = defineRpcContract({
       clean: z.boolean(), head: z.string(), aheadOfBase: z.boolean(),
       changedFiles: z.array(z.object({ path: z.string(), status: z.enum(["added", "modified", "deleted", "renamed", "untracked", "conflicted"]) })),
     }),
+  },
+  session_expansion_options: {
+    input: z.object({ threadId: z.string() }).strict(),
+    output: z.object({ session: sessionSchema, repositories: z.array(expansionOptionSchema) }).strict(),
+  },
+  session_add_repository: {
+    input: z.object({
+      threadId: z.string(), projectId: z.string(), requestKey: z.string().min(8).max(200),
+    }).strict(),
+    output: expansionResultSchema,
   },
 });
 
@@ -121,8 +140,95 @@ export default async function plugin(bb: BbPluginApi) {
     return ensureWorkspaceProject(workspaceProjectDeps, hostId);
   }
 
+  const expansion = new SessionExpansionService({
+    store,
+    listProjects: projects,
+    requestApproval: async (payload, signal) => {
+      const session = store.getSession(payload.sessionId);
+      if (!session.threadId) throw new Error("Session thread is unavailable");
+      const response = await bb.ui.requestInput({
+        threadId: session.threadId,
+        rendererId: "workspace-add-repository",
+        title: `Add ${payload.repositoryAlias} to ${payload.workspaceName}?`,
+        payload,
+      }, { signal });
+      if (response.outcome === "cancelled") return { action: "cancel" };
+      return expansionApprovalResponseSchema.parse(response.value);
+    },
+    addRepository: (input, hostId) => host.call("add_repository", input, { hostId }),
+    readSession: (sessionId, hostId) => host.call("read_session", { sessionId }, { hostId }),
+    publishChanged: async () => { changed(); },
+    reportError: ({ operation, sessionId, error }) => {
+      const context = JSON.stringify({ operation, sessionId: sessionId.slice(0, 200), error: error.slice(0, 1_000) });
+      bb.log.error(`Workspaces notification failed: ${context}`);
+    },
+  });
+
+  function resultWithSession(threadId: string, result: ExpansionResult) {
+    const session = store.getSessionByThreadId(threadId);
+    if (!session) throw new Error("This thread is not a workspace session");
+    return {
+      added: result.added,
+      alias: result.alias,
+      worktreePath: result.added ? session.repositories.find((repository) => repository.alias === result.alias)?.worktreePath ?? null : null,
+      policy: result.policy,
+      session,
+    };
+  }
+
+  async function reconcileActiveSessionsForListing() {
+    const results = await expansion.reconcileActiveSessions();
+    const errors = new Map<string, string>();
+    for (const result of results) {
+      if (!result.error) continue;
+      errors.set(result.sessionId, result.error);
+      bb.log.warn(`Workspaces session reconciliation failed: ${JSON.stringify({ sessionId: result.sessionId.slice(0, 200), error: result.error.slice(0, 1_000) })}`);
+    }
+    return errors;
+  }
+
+  function sessionsWithReconciliationErrors(errors: ReadonlyMap<string, string>) {
+    return store.listSessions().map((session) => ({ ...session, error: errors.get(session.id) ?? session.error }));
+  }
+
+  bb.agents.registerTool({
+    name: "workspace_add_repository",
+    description: "Request another repository from this thread's saved multi-repository workspace.",
+    instructions: "Use only when the task requires a workspace repository that is not already in session.json. Explain the concrete dependency in reason.",
+    presentation: {
+      label: { pending: "Requesting workspace repository", completed: "Requested workspace repository" },
+      suppress: true,
+    },
+    parameters: z.object({
+      repository: z.string().regex(/^[a-z][a-z0-9-]{0,47}$/),
+      reason: z.string().trim().min(1).max(2_000),
+    }).strict(),
+    async execute({ repository, reason }, { threadId, signal }) {
+      const result = resultWithSession(threadId, await expansion.requestFromAgent({
+        threadId, alias: repository, reason, requestKey: `agent-${randomUUID()}`, signal,
+      }));
+      return result.added
+        ? `Repository ${result.alias} is ready at ${result.worktreePath}. Re-read session.json and continue there.`
+        : "Repository request was cancelled; the session was not changed.";
+    },
+  });
+
+  bb.agents.configure((context) => {
+    if (context.origin.pluginId !== "workspaces" || !store.hasSessionForThread(context.thread.id)) {
+      return { tools: [], skills: [] };
+    }
+    return {
+      tools: ["workspace_add_repository"],
+      skills: ["multi-repo-workspaces"],
+      instructions: "This is an append-only Workspaces session. If a current workspace member is required but absent from session.json, request it with workspace_add_repository.",
+    };
+  });
+
   bb.rpc.register(rpcContract, {
-    dashboard: async () => ({ workspaces: store.list(true), sessions: store.listSessions(), projects: await projects() }),
+    dashboard: async () => {
+      const errors = await reconcileActiveSessionsForListing();
+      return { workspaces: store.list(true), sessions: sessionsWithReconciliationErrors(errors), projects: await projects() };
+    },
     workspace_create: async (draft) => {
       await assertWorkspaceMembership(draft);
       const workspace = store.create(draft); changed(); return workspace;
@@ -212,6 +318,17 @@ export default async function plugin(bb: BbPluginApi) {
       if (!repository?.worktreePath || !repository.baseCommit || !session.hostId) throw new Error("Repository checkout is not ready");
       return host.call("repository_status", { worktreePath: repository.worktreePath, baseCommit: repository.baseCommit }, { hostId: session.hostId });
     },
+    session_expansion_options: async ({ threadId }) => {
+      const session = store.getSessionByThreadId(threadId);
+      if (!session) throw new Error("This thread is not a workspace session");
+      const reconciled = await expansion.reconcileSession(session.id);
+      return { session: reconciled, repositories: await expansion.optionsForThread(threadId) };
+    },
+    session_add_repository: async ({ threadId, projectId, requestKey }) => {
+      return resultWithSession(threadId, await expansion.addManually({
+        threadId, projectId, requestKey, reason: "Added from the Repositories panel",
+      }));
+    },
   });
 
   const usage = ["Usage:", "  bb workspaces list [--json]", "  bb workspaces show <workspace-id> [--json]", "  bb workspaces sessions [--json]"].join("\n");
@@ -227,7 +344,10 @@ export default async function plugin(bb: BbPluginApi) {
       const output = (value: unknown, human: string) => ({ exitCode: 0, stdout: json ? JSON.stringify(value, null, 2) : human });
       if (args[0] === "list") { const rows = store.list(true); return output(rows, rows.length ? rows.map((workspace) => `${workspace.id}  ${workspace.name}  (${workspace.repositories.length} repos)`).join("\n") : "No workspaces."); }
       if (args[0] === "show" && args.length === 2) { const workspace = store.get(args[1]!); return output(workspace, `${workspace.name}\n${workspace.repositories.map((repository) => `  ${repository.alias}: ${repository.projectId}`).join("\n")}`); }
-      if (args[0] === "sessions") { const rows = store.listSessions(); return output(rows, rows.length ? rows.map((session) => `${session.id}  ${session.state}  ${session.workspaceName}`).join("\n") : "No sessions."); }
+      if (args[0] === "sessions") {
+        const rows = sessionsWithReconciliationErrors(await reconcileActiveSessionsForListing());
+        return output(rows, rows.length ? rows.map((session) => `${session.id}  ${session.state}  ${session.workspaceName}${session.error ? `  ERROR: ${session.error}` : ""}`).join("\n") : "No sessions.");
+      }
       return { exitCode: args[0] === undefined || args[0] === "help" || args[0] === "--help" ? 0 : 1, stdout: usage };
     },
   });

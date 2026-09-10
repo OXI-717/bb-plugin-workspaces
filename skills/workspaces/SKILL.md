@@ -21,5 +21,5 @@ Do not search for or modify sibling repositories that are absent from `session.j
 - Keep changes separated by repository and report validation results for each repository.
 - When an interface change spans repositories, update the producer and consumers coherently, then run the narrow tests in every affected checkout.
 - Do not move files between repositories as a substitute for making the corresponding repository changes.
-- Do not change the session manifest, or remove session worktrees yourself.
-
+- Do not edit `session.json` manually, or remove session worktrees yourself.
+- If a repository already belongs to this saved workspace but is absent from `session.json`, you may call `workspace_add_repository` for a concrete missing dependency. Include the reason it is required and proceed only after the tool reports that its worktree is ready; then re-read `session.json`.

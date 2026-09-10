@@ -16,7 +16,7 @@ export type SessionExpansionDeps = {
   reportError?(input: { operation: "workspaces-changed"; sessionId: string; error: string }): void;
 };
 export type AgentExpansionRequest = { threadId: string; alias: string; reason: string; requestKey: string; signal?: AbortSignal };
-export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string };
+export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string; reason?: string };
 export type ExpansionResult = { added: boolean; alias: string; policy: "ask" | "auto"; cancelled?: boolean; pending?: boolean; recovered?: boolean; error?: string };
 export type ActiveReconciliationResult = { sessionId: string; session?: SessionSnapshot; error?: string };
 
@@ -43,6 +43,7 @@ export class SessionExpansionService {
 
   addManually(input: ManualExpansionRequest): Promise<ExpansionResult> {
     requestKeySchema.parse(input.requestKey);
+    if (input.reason !== undefined) reasonSchema.parse(input.reason);
     return this.runOnce(input.requestKey, () => this.addManuallyOnce(input));
   }
 
@@ -104,7 +105,7 @@ export class SessionExpansionService {
     const session = this.sessionForThread(input.threadId);
     const option = (await this.optionsForSession(session)).find((candidate) => candidate.projectId === input.projectId);
     if (!option) throw new Error(`Project ${input.projectId} is not eligible for this session`);
-    const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
+    const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason ?? "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
     if (!claim.claimed) return this.replay(claim.expansion);
     try {
       const result = await this.provision(session.id, option, input.requestKey);

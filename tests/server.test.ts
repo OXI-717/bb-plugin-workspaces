@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import { describe, expect, it, vi } from "vitest";
+import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "../server";
 
 const projects = [
@@ -299,5 +299,154 @@ describe("Workspaces plugin server", () => {
     })).rejects.toThrow("cannot be selected as a repository");
     expect(hostCalls.filter((method) => method === "prepare_session")).toHaveLength(1);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
+
+  it("expands only a workspace session through approved, alias-resolved requests", async () => {
+    const billing = {
+      ...projects[1]!,
+      id: "proj_billing",
+      name: "billing-service",
+      gitRemoteUrl: "https://example.invalid/billing.git",
+      sources: [{
+        ...projects[1]!.sources[0]!,
+        id: "src_billing",
+        projectId: "proj_billing",
+        path: "/repos/billing",
+      }],
+    };
+    const availableProjects = [...projects, billing];
+    const hostCalls: Array<{ method: string; input: unknown }> = [];
+    let sessionId = "";
+    const repositories: Array<{
+      projectId: string; alias: string; sourcePath: string; baseRef: string;
+      baseCommit: string; branch: string; worktreePath: string;
+    }> = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "workspaces",
+      agentSkillIds: ["multi-repo-workspaces"],
+      sdk: {
+        projects: {
+          list: async () => availableProjects,
+          create: async ({ name, source }) => {
+            const workspaceProject = {
+              ...projects[0]!, id: "proj_workspaces", name,
+              sources: [{ ...projects[0]!.sources[0]!, id: "src_workspaces", projectId: "proj_workspaces", hostId: source.hostId, path: source.path }],
+            };
+            availableProjects.push(workspaceProject);
+            return workspaceProject;
+          },
+        },
+        threads: { spawn: async () => makeThreadResponse({ id: "thr_workspace", projectId: "proj_workspaces" }) },
+      },
+      experimental_hostEntry: true,
+      experimental_callHostRpc: async ({ method, input }) => {
+        hostCalls.push({ method, input });
+        if (method === "ensure_anchor") return { path: "/plugin/anchor" };
+        if (method === "prepare_session") {
+          const request = input as { sessionId: string; repositories: Array<{ projectId: string; alias: string; sourcePath: string; baseRef: string }> };
+          sessionId = request.sessionId;
+          repositories.push(...request.repositories.map((repository) => ({
+            ...repository, baseCommit: `commit-${repository.alias}`,
+            branch: `bb-workspace/${request.sessionId}/${repository.alias}`,
+            worktreePath: `/plugin-data/sessions/${request.sessionId}/repos/${repository.alias}`,
+          })));
+          return { rootPath: `/plugin-data/sessions/${request.sessionId}`, repositories };
+        }
+        if (method === "read_session") return {
+          schemaVersion: 2, owner: "bb-plugin-workspaces", sessionId,
+          workspaceName: "Services", instructions: "Coordinate the services.", revision: repositories.length,
+          repositories, operations: [],
+        };
+        if (method === "add_repository") {
+          const request = input as { operationKey: string; repository: { projectId: string; alias: string; sourcePath: string; baseRef: string } };
+          const repository = {
+            ...request.repository, baseCommit: `commit-${request.repository.alias}`,
+            branch: `bb-workspace/${sessionId}/${request.repository.alias}`,
+            worktreePath: `/plugin-data/sessions/${sessionId}/repos/${request.repository.alias}`,
+          };
+          repositories.push(repository);
+          return { repository, manifestRevision: repositories.length };
+        }
+        throw new Error(`Unexpected host method: ${method}`);
+      },
+    });
+    await plugin(bb);
+
+    expect(harness.inspection.registrations.agentTools.some((tool) => tool.name === "workspace_add_repository")).toBe(true);
+    const workspace = await harness.behavior.callRpc("workspace_create", {
+      name: "Services", description: "", instructions: "Coordinate the services.",
+      repositories: [
+        { projectId: "proj_auth", alias: "identity" },
+        { projectId: "proj_gateway", alias: "gateway" },
+        { projectId: "proj_billing", alias: "billing" },
+      ],
+    }) as { id: string; revision: number };
+    await harness.behavior.callRpc("session_start", {
+      workspaceId: workspace.id, expectedRevision: workspace.revision, hostId: "host_local",
+      projectIds: ["proj_auth"], prompt: "Update the identity contract.", requestKey: "workspace-session-1",
+    });
+
+    const configuration = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: "thr_workspace" },
+        project: { id: "proj_workspaces", name: "🧩 Workspaces" },
+        origin: { kind: null, pluginId: "workspaces" },
+      }),
+    );
+    expect(configuration.tools.map((tool) => tool.name)).toContain("workspace_add_repository");
+    expect(configuration.skills).toEqual(["multi-repo-workspaces"]);
+    await expect(harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: "thr_unrelated" },
+        origin: { kind: "fork", pluginId: "side-chat" },
+      }),
+    )).resolves.toMatchObject({ tools: [], skills: [] });
+
+    const options = await harness.behavior.callRpc("session_expansion_options", { threadId: "thr_workspace" }) as {
+      repositories: Array<{ projectId: string; alias: string; sourcePath: string }>;
+    };
+    expect(options.repositories).toEqual(expect.arrayContaining([
+      expect.objectContaining({ projectId: "proj_gateway", alias: "gateway", sourcePath: "/repos/gateway" }),
+      expect.objectContaining({ projectId: "proj_billing", alias: "billing", sourcePath: "/repos/billing" }),
+    ]));
+
+    const toolRequest = harness.behavior.callAgentTool("workspace_add_repository", {
+      repository: "gateway", reason: "The API gateway must consume the identity contract change.",
+    }, { threadId: "thr_workspace" });
+    await vi.waitFor(() => expect(harness.inspection.pendingInteractions).toHaveLength(1));
+    const interaction = harness.inspection.pendingInteractions[0]!;
+    expect(interaction).toMatchObject({
+      threadId: "thr_workspace", rendererId: "workspace-add-repository",
+      payload: { repositoryAlias: "gateway", reason: "The API gateway must consume the identity contract change." },
+    });
+    harness.behavior.submitInteraction(interaction.id, { action: "add-and-auto" });
+    await expect(toolRequest).resolves.toBe(`Repository gateway is ready at /plugin-data/sessions/${sessionId}/repos/gateway. Re-read session.json and continue there.`);
+    expect(hostCalls.filter((call) => call.method === "add_repository")).toContainEqual({
+      method: "add_repository",
+      input: {
+        sessionId,
+        operationKey: expect.stringMatching(/^agent-/),
+        repository: { projectId: "proj_gateway", alias: "gateway", sourcePath: "/repos/gateway", baseRef: "HEAD" },
+      },
+    });
+
+    const manuallyAdded = await harness.behavior.callRpc("session_add_repository", {
+      threadId: "thr_workspace", projectId: "proj_billing", requestKey: "manual-billing-1",
+    }) as {
+      added: boolean; alias: string; worktreePath: string | null; policy: string;
+      session: { expansions: Array<{ reason: string }> };
+    };
+    expect(manuallyAdded).toMatchObject({
+      added: true, alias: "billing", worktreePath: `/plugin-data/sessions/${sessionId}/repos/billing`, policy: "auto",
+    });
+    expect(manuallyAdded.session.expansions.at(-1)?.reason).toBe("Added from the Repositories panel");
+    expect(hostCalls.filter((call) => call.method === "add_repository")).toContainEqual({
+      method: "add_repository",
+      input: {
+        sessionId,
+        operationKey: "manual-billing-1",
+        repository: { projectId: "proj_billing", alias: "billing", sourcePath: "/repos/billing", baseRef: "HEAD" },
+      },
+    });
   });
 });
