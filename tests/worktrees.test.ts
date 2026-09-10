@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,6 +52,30 @@ describe("multi-repository session worktrees", () => {
     writeFileSync(join(anchor.path, ".bb-workspaces-anchor.json"), JSON.stringify({ schemaVersion: 1, owner: "other" }));
     await expect(ensureAnchor(dataRoot)).rejects.toThrow(/anchor/i);
     expect(existsSync(anchor.path)).toBe(true);
+  });
+
+  it("rejects symlinked owned-path components before reading or creating outside dataRoot", async () => {
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    const outside = mkdtempSync(join(tmpdir(), "bb-workspaces-outside-"));
+    roots.push(dataRoot, outside);
+    symlinkSync(outside, join(dataRoot, "workspace-anchor"));
+
+    await expect(ensureAnchor(dataRoot)).rejects.toThrow(/symlink/i);
+    expect(existsSync(join(outside, ".bb-workspaces-anchor.json"))).toBe(false);
+
+    mkdirSync(join(dataRoot, "sessions"));
+    symlinkSync(outside, join(dataRoot, "sessions", "session_escape"));
+    expect(() => readSessionManifest(dataRoot, "session_escape")).toThrow(/symlink/i);
+
+    const guardedRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(guardedRoot);
+    symlinkSync(outside, join(guardedRoot, "sessions"));
+    const auth = repository("symlink-ancestor");
+    await expect(prepareSession({
+      dataRoot: guardedRoot, sessionId: "session_new", workspaceName: "Guarded", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    })).rejects.toThrow(/symlink/i);
+    expect(existsSync(join(outside, "session_new"))).toBe(false);
   });
 
   it("creates isolated worktrees and a compact repository map", async () => {
@@ -217,6 +241,69 @@ describe("multi-repository session worktrees", () => {
     expect(existsSync(join(prepared.rootPath, "repos/audits"))).toBe(false);
     expect(git(audits.path, "branch", "--list", "bb-workspace/session-rollback/audits")).toBe("");
     expect(readSessionManifest(dataRoot, "session_rollback").revision).toBe(1);
+  });
+
+  it("removes artifacts created before a worktree command reports failure", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await prepareSession({
+      dataRoot, sessionId: "session_partial", workspaceName: "Partial", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+    const worktreePath = join(dataRoot, "sessions/session_partial/repos/audits");
+    const branch = "bb-workspace/session-partial/audits";
+    const outcome = await addRepository({
+      dataRoot, sessionId: "session_partial", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+      fileOperations: {
+        addWorktree: async () => {
+          git(audits.path, "worktree", "add", worktreePath, branch);
+          throw new Error("worktree command reported failure");
+        },
+      },
+    }).then(() => null, (error: unknown) => error);
+
+    if (outcome === null) {
+      git(audits.path, "worktree", "remove", worktreePath);
+      git(audits.path, "branch", "-D", branch);
+    }
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/worktree command reported failure/);
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(git(audits.path, "branch", "--list", branch)).toBe("");
+  });
+
+  it("keeps the new repository recoverable when restoring AGENTS.md fails", async () => {
+    const auth = repository("auth");
+    const audits = repository("audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await prepareSession({
+      dataRoot, sessionId: "session_restore", workspaceName: "Restore", instructions: "",
+      repositories: [{ projectId: "proj_auth", alias: "auth", sourcePath: auth.path, baseRef: auth.commit }],
+    });
+    const worktreePath = join(dataRoot, "sessions/session_restore/repos/audits");
+    const branch = "bb-workspace/session-restore/audits";
+    const outcome = await addRepository({
+      dataRoot, sessionId: "session_restore", operationKey: "expand-audits-1",
+      repository: { projectId: "proj_audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" },
+      fileOperations: {
+        writeAtomic: async () => { throw new Error("manifest unavailable"); },
+        restoreInstructions: async () => { throw new Error("instructions restore unavailable"); },
+      },
+    }).then(() => null, (error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/manifest unavailable/);
+    expect((outcome as Error).message).toMatch(/instructions restore unavailable/);
+    expect(readFileSync(join(dataRoot, "sessions/session_restore/AGENTS.md"), "utf8")).toContain("`repos/audits`");
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(git(audits.path, "branch", "--list", branch)).not.toBe("");
+
+    git(audits.path, "worktree", "remove", worktreePath);
+    git(audits.path, "branch", "-D", branch);
   });
 
   it("serializes concurrent additions for one session into one repository", async () => {

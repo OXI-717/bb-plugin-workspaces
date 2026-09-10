@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -37,7 +37,9 @@ export type SessionManifest = {
 };
 
 export type SessionFileOperations = {
-  writeAtomic: (path: string, contents: string) => Promise<void>;
+  writeAtomic?: (path: string, contents: string) => Promise<void>;
+  addWorktree?: (input: { sourcePath: string; branch: string; worktreePath: string }) => Promise<void>;
+  restoreInstructions?: (path: string, contents: string) => Promise<void>;
 };
 
 export type ChangedFile = {
@@ -72,12 +74,34 @@ function assertSafeAlias(alias: string): void {
   if (!/^[a-z][a-z0-9-]{0,47}$/.test(alias)) throw new Error(`Invalid repository alias: ${alias}`);
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error ? String(error.code) : undefined;
+}
+
+function ownedPath(dataRoot: string, components: string[]): string {
+  const declaredRoot = resolve(dataRoot);
+  const rootPath = realpathSync(declaredRoot);
+  let candidate = rootPath;
+  for (let index = 0; index < components.length; index += 1) {
+    candidate = join(candidate, components[index]!);
+    try {
+      if (lstatSync(candidate).isSymbolicLink()) {
+        throw new Error(`Owned path component is a symlink: ${candidate}`);
+      }
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return join(declaredRoot, ...components);
+      throw error;
+    }
+  }
+  return join(declaredRoot, ...components);
+}
+
 function sessionPaths(dataRoot: string, sessionId: string): { sessionsRoot: string; rootPath: string; reposRoot: string } {
   assertSafeSessionId(sessionId);
-  const sessionsRoot = resolve(dataRoot, "sessions");
-  const rootPath = resolve(sessionsRoot, sessionId);
-  if (!rootPath.startsWith(`${sessionsRoot}${sep}`)) throw new Error("Invalid session id");
-  return { sessionsRoot, rootPath, reposRoot: join(rootPath, "repos") };
+  const sessionsRoot = ownedPath(dataRoot, ["sessions"]);
+  const rootPath = ownedPath(dataRoot, ["sessions", sessionId]);
+  const reposRoot = ownedPath(dataRoot, ["sessions", sessionId, "repos"]);
+  return { sessionsRoot, rootPath, reposRoot };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -198,18 +222,19 @@ export async function writeAtomic(path: string, contents: string): Promise<void>
 }
 
 export async function ensureAnchor(dataRoot: string): Promise<{ path: string }> {
-  const anchorPath = join(resolve(dataRoot), "workspace-anchor");
-  const markerPath = join(anchorPath, ".bb-workspaces-anchor.json");
+  let anchorPath = ownedPath(dataRoot, ["workspace-anchor"]);
   const marker = `${JSON.stringify({ schemaVersion: 1, owner: "bb-plugin-workspaces" })}\n`;
   await mkdir(anchorPath, { recursive: true });
+  anchorPath = ownedPath(dataRoot, ["workspace-anchor"]);
+  const ownedMarkerPath = join(anchorPath, ".bb-workspaces-anchor.json");
   try {
-    await writeFile(markerPath, marker, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await writeFile(ownedMarkerPath, marker, { encoding: "utf8", mode: 0o600, flag: "wx" });
   } catch (error) {
     const code = error instanceof Error && "code" in error ? String(error.code) : "";
     if (code !== "EEXIST") throw error;
     let existing: unknown;
     try {
-      existing = JSON.parse(await readFile(markerPath, "utf8"));
+      existing = JSON.parse(await readFile(ownedMarkerPath, "utf8"));
     } catch {
       throw new Error("Workspace anchor marker is invalid");
     }
@@ -249,17 +274,21 @@ export async function prepareSession(input: {
     aliases.add(repository.alias);
   }
 
-  const { sessionsRoot, rootPath, reposRoot } = sessionPaths(input.dataRoot, input.sessionId);
-  await mkdir(sessionsRoot, { recursive: true });
+  let paths = sessionPaths(input.dataRoot, input.sessionId);
+  await mkdir(paths.sessionsRoot, { recursive: true });
+  paths = sessionPaths(input.dataRoot, input.sessionId);
   try {
-    await mkdir(rootPath);
+    await mkdir(paths.rootPath);
   } catch (error) {
     const code = error instanceof Error && "code" in error ? String(error.code) : "";
-    if (code === "EEXIST") throw new Error(`Session directory already exists: ${rootPath}`);
+    if (code === "EEXIST") throw new Error(`Session directory already exists: ${paths.rootPath}`);
     throw error;
   }
 
-  await mkdir(reposRoot);
+  paths = sessionPaths(input.dataRoot, input.sessionId);
+  await mkdir(paths.reposRoot);
+  paths = sessionPaths(input.dataRoot, input.sessionId);
+  const { rootPath, reposRoot } = paths;
   const prepared: PreparedRepository[] = [];
   try {
     for (const repository of input.repositories) {
@@ -331,21 +360,47 @@ function validateRequestedRepository(repository: PrepareRepository): PrepareRepo
   return { ...repository, sourcePath };
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function branchExists(sourcePath: string, branch: string): Promise<boolean> {
+  try {
+    await git(sourcePath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "1") return false;
+    throw error;
+  }
+}
+
+function recoveryError(cause: unknown, failures: unknown[]): Error {
+  const original = cause instanceof Error ? cause.message : String(cause);
+  const recovery = failures.map((failure) => failure instanceof Error ? failure.message : String(failure)).join("; ");
+  return new Error(`Repository provisioning failed: ${original}; recovery failed: ${recovery}`);
+}
+
 export async function addRepository(input: {
   dataRoot: string;
   sessionId: string;
   operationKey: string;
   repository: PrepareRepository;
-  /** Testable failure seam for the final manifest publication only. */
+  /** Testable seams for post-side-effect failure and metadata recovery. */
   fileOperations?: SessionFileOperations;
 }): Promise<{ repository: PreparedRepository; manifestRevision: number }> {
   assertSafeSessionId(input.sessionId);
   assertString(input.operationKey, "operation key");
   const repository = validateRequestedRepository(input.repository);
-  const { rootPath, reposRoot } = sessionPaths(input.dataRoot, input.sessionId);
   const queueKey = `${resolve(input.dataRoot)}:${input.sessionId}`;
   return serializeSession(queueKey, async () => {
     const manifest = readSessionManifest(input.dataRoot, input.sessionId);
+    const { rootPath, reposRoot } = sessionPaths(input.dataRoot, input.sessionId);
     const replayedOperation = manifest.operations.find((operation) => operation.key === input.operationKey);
     if (replayedOperation) {
       const existing = manifest.repositories.find((candidate) => candidate.projectId === replayedOperation.projectId);
@@ -361,15 +416,23 @@ export async function addRepository(input: {
     const worktreePath = join(reposRoot, repository.alias);
     const branch = `bb-workspace/${sessionSlug(input.sessionId)}/${repository.alias}`;
     const baseCommit = await git(repository.sourcePath, ["rev-parse", "--verify", `${repository.baseRef}^{commit}`]);
+    if (await pathExists(worktreePath)) throw new Error(`Repository worktree path already exists: ${worktreePath}`);
+    if (await branchExists(repository.sourcePath, branch)) throw new Error(`Repository branch already exists: ${branch}`);
     const prepared: PreparedRepository = { ...repository, baseCommit, branch, worktreePath };
-    let worktreeCreated = false;
     let branchCreated = false;
+    let worktreeAttempted = false;
+    let agentsReplaced = false;
     const agentsPath = join(rootPath, "AGENTS.md");
     const priorAgents = await readFile(agentsPath, "utf8");
     try {
-      await git(repository.sourcePath, ["worktree", "add", "-b", branch, worktreePath, baseCommit]);
-      worktreeCreated = true;
+      await git(repository.sourcePath, ["branch", branch, baseCommit]);
       branchCreated = true;
+      worktreeAttempted = true;
+      if (input.fileOperations?.addWorktree) {
+        await input.fileOperations.addWorktree({ sourcePath: repository.sourcePath, branch, worktreePath });
+      } else {
+        await git(repository.sourcePath, ["worktree", "add", worktreePath, branch]);
+      }
       const nextManifest: SessionManifest = {
         ...manifest,
         revision: manifest.revision + 1,
@@ -377,17 +440,37 @@ export async function addRepository(input: {
         operations: [...manifest.operations, { key: input.operationKey, projectId: repository.projectId, alias: repository.alias }],
       };
       await writeAtomic(agentsPath, rootAgents(manifest.workspaceName, manifest.instructions, nextManifest.repositories));
+      agentsReplaced = true;
       await (input.fileOperations?.writeAtomic ?? writeAtomic)(
         join(rootPath, "session.json"),
         `${JSON.stringify(nextManifest, null, 2)}\n`,
       );
       return { repository: prepared, manifestRevision: nextManifest.revision };
     } catch (error) {
-      if (worktreeCreated) {
-        await writeAtomic(agentsPath, priorAgents).catch(() => undefined);
-        await git(repository.sourcePath, ["worktree", "remove", worktreePath]).catch(() => undefined);
+      if (agentsReplaced) {
+        try {
+          await (input.fileOperations?.restoreInstructions ?? writeAtomic)(agentsPath, priorAgents);
+        } catch (restoreError) {
+          throw recoveryError(error, [restoreError]);
+        }
       }
-      if (branchCreated) await git(repository.sourcePath, ["branch", "-D", branch]).catch(() => undefined);
+      const recoveryFailures: unknown[] = [];
+      if (worktreeAttempted && await pathExists(worktreePath)) {
+        try {
+          sessionPaths(input.dataRoot, input.sessionId);
+          await git(repository.sourcePath, ["worktree", "remove", "--force", worktreePath]);
+        } catch (worktreeError) {
+          recoveryFailures.push(worktreeError);
+        }
+      }
+      if (branchCreated && recoveryFailures.length === 0) {
+        try {
+          await git(repository.sourcePath, ["branch", "-D", branch]);
+        } catch (branchError) {
+          recoveryFailures.push(branchError);
+        }
+      }
+      if (recoveryFailures.length > 0) throw recoveryError(error, recoveryFailures);
       throw error;
     }
   });
