@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
   workspaceDraftSchema,
+  EXPANSION_ERROR_MAX_CHARS,
+  type ExpansionPhase,
   type ExpansionApprovalMode,
   type ExpansionOutcome,
   type ExpansionPolicy,
@@ -58,6 +60,7 @@ type ExpansionRow = {
   requester: ExpansionRequester;
   approval_mode: ExpansionApprovalMode;
   outcome: ExpansionOutcome;
+  phase: ExpansionPhase | null;
   request_key: string;
   error: string | null;
   created_at: number;
@@ -148,6 +151,8 @@ export const WORKSPACE_MIGRATIONS = [`
   CREATE UNIQUE INDEX IF NOT EXISTS session_expansions_provisioned_repo
   ON session_expansions(session_id, project_id)
   WHERE outcome = 'provisioned';
+`, `
+  ALTER TABLE session_expansions ADD COLUMN phase TEXT;
 `];
 
 const WORKSPACE_PROJECT_ID_METADATA_KEY = "workspace-project-id";
@@ -304,7 +309,15 @@ export class WorkspaceStore {
 
   /** @deprecated Retained for launch compatibility; it cannot remove or rename existing members. */
   setSessionRepositories(id: string, repositories: SessionRepository[]): SessionSnapshot {
-    return this.reconcileRepositories(id, repositories, this.getSession(id).manifestRevision);
+    return this.db.transaction(() => {
+      const current = this.getSession(id);
+      this.reconcileRepositories(id, repositories, current.manifestRevision);
+      if (current.state === "preparing" && current.initialRepositories.every((repository) => !repository.baseCommit)) {
+        if (repositories.length !== current.initialRepositories.length) throw new Error("Initial preparation cannot expand membership");
+        this.db.prepare("UPDATE sessions SET initial_repositories_json = ? WHERE id = ?").run(JSON.stringify(repositories), id);
+      }
+      return this.getSession(id);
+    })();
   }
 
   setExpansionPolicy(id: string, policy: ExpansionPolicy): SessionSnapshot {
@@ -326,9 +339,9 @@ export class WorkspaceStore {
       const now = Date.now();
       const id = `expansion_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       this.db.prepare(`INSERT INTO session_expansions
-        (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`)
-        .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now);
+        (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at, phase)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?, ?)`)
+        .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now, input.requester === "user" ? "approved" : "awaiting-approval");
       return { expansion: this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE id = ?").get(id) as ExpansionRow), claimed: true };
     })();
   }
@@ -345,7 +358,7 @@ export class WorkspaceStore {
       if (existing.outcome !== "pending") return this.hydrateExpansion(existing);
       const now = Date.now();
       this.db.prepare("UPDATE session_expansions SET outcome = ?, error = ?, updated_at = ? WHERE request_key = ?")
-        .run(outcome, error ?? null, now, requestKey);
+        .run(outcome, error?.slice(0, EXPANSION_ERROR_MAX_CHARS) ?? null, now, requestKey);
       return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow);
     })();
   }
@@ -355,9 +368,12 @@ export class WorkspaceStore {
       const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow | undefined;
       if (!existing) throw new Error(`Expansion ${requestKey} was not found`);
       if (existing.outcome !== "pending") return this.hydrateExpansion(existing);
+      const session = this.getSession(existing.session_id);
+      if (!session.repositories.some((repository) => repository.projectId === existing.project_id && repository.alias === existing.alias)) throw new Error("Provisioned repository is not recorded");
+      const prior = this.db.prepare("SELECT 1 FROM session_expansions WHERE session_id = ? AND project_id = ? AND outcome = 'provisioned'").get(existing.session_id, existing.project_id);
       const now = Date.now();
-      this.db.prepare("UPDATE session_expansions SET outcome = 'provisioned', error = NULL, updated_at = ? WHERE request_key = ?")
-        .run(now, requestKey);
+      this.db.prepare("UPDATE session_expansions SET outcome = ?, error = NULL, updated_at = ? WHERE request_key = ?")
+        .run(prior ? "superseded" : "provisioned", now, requestKey);
       return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow);
     })();
   }
@@ -373,6 +389,20 @@ export class WorkspaceStore {
     return this.getExpansionByRequestKey(requestKey)!;
   }
 
+  approveExpansion(requestKey: string, approvalMode: ExpansionApprovalMode, auto = false): void {
+    this.db.transaction(() => {
+      const expansion = this.getExpansionByRequestKey(requestKey);
+      if (!expansion || expansion.outcome !== "pending") throw new Error("Expansion is no longer pending");
+      this.setExpansionApprovalMode(requestKey, approvalMode);
+      this.setExpansionPhase(requestKey, "approved");
+      if (auto) this.setExpansionPolicy(expansion.sessionId, "auto");
+    })();
+  }
+
+  setExpansionPhase(requestKey: string, phase: ExpansionPhase): void {
+    this.db.prepare("UPDATE session_expansions SET phase = ?, updated_at = ? WHERE request_key = ? AND outcome = 'pending'").run(phase, Date.now(), requestKey);
+  }
+
   appendProvisionedRepository(input: AppendProvisionedRepositoryInput): SessionSnapshot {
     this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(input.sessionId) as SessionRow | undefined;
@@ -382,31 +412,34 @@ export class WorkspaceStore {
       if (expansion.project_id !== input.repository.projectId || expansion.alias !== input.repository.alias) {
         throw new Error("Provisioned repository does not match its expansion request");
       }
-      if (expansion.outcome !== "pending" && expansion.outcome !== "provisioned") throw new Error("Expansion is no longer pending");
-      if (expansion.outcome === "provisioned") return;
+      if (expansion.outcome === "provisioned" || expansion.outcome === "superseded") return;
+      if (expansion.outcome !== "pending") throw new Error("Expansion is no longer pending");
       if (input.manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
       const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
       const existing = repositories.find((repository) => repository.projectId === input.repository.projectId);
       if (existing && existing.alias !== input.repository.alias) throw new Error("Cannot replace an existing session repository");
       const nextRepositories = existing ? repositories : [...repositories, input.repository];
       const now = Date.now();
-      this.db.prepare(`UPDATE sessions SET repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?`)
+      this.db.prepare(`UPDATE sessions SET initial_repositories_json = COALESCE(initial_repositories_json, repositories_json), repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?`)
         .run(JSON.stringify(nextRepositories), input.manifestRevision, now, input.sessionId);
-      this.db.prepare(`UPDATE session_expansions SET outcome = 'provisioned', error = NULL, updated_at = ? WHERE request_key = ?`)
-        .run(now, input.requestKey);
+      this.finishProvisionedExpansion(input.requestKey);
     })();
     return this.getSession(input.sessionId);
   }
 
-  reconcileRepositories(sessionId: string, repositories: SessionRepository[], manifestRevision: number): SessionSnapshot {
+  reconcileRepositories(sessionId: string, repositories: SessionRepository[], manifestRevision: number, operations: Array<{ key: string; projectId: string; alias: string }> = []): SessionSnapshot {
     this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as SessionRow | undefined;
       if (!row) throw new Error(`Session ${sessionId} was not found`);
       if (manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
       const current = JSON.parse(row.repositories_json) as SessionRepository[];
       this.assertAppendOnlyMembership(current, repositories);
-      this.db.prepare("UPDATE sessions SET repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?")
+      this.db.prepare("UPDATE sessions SET initial_repositories_json = COALESCE(initial_repositories_json, repositories_json), repositories_json = ?, manifest_revision = ?, updated_at = ? WHERE id = ?")
         .run(JSON.stringify(repositories), manifestRevision, Date.now(), sessionId);
+      for (const operation of operations) {
+        const expansion = this.getExpansionByRequestKey(operation.key);
+        if (expansion?.sessionId === sessionId && expansion.projectId === operation.projectId && expansion.alias === operation.alias && repositories.some((repository) => repository.projectId === operation.projectId && repository.alias === operation.alias)) this.finishProvisionedExpansion(operation.key);
+      }
     })();
     return this.getSession(sessionId);
   }
@@ -482,8 +515,9 @@ export class WorkspaceStore {
       requester: row.requester,
       approvalMode: row.approval_mode,
       outcome: row.outcome,
+      phase: row.phase ?? null,
       requestKey: row.request_key,
-      error: row.error,
+      error: row.error?.slice(0, EXPANSION_ERROR_MAX_CHARS) ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

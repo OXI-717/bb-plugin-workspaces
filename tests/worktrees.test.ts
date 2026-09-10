@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { hostContract } from "../src/host-contract";
 import {
   addRepository,
   cleanupSession,
@@ -35,6 +36,29 @@ afterEach(() => {
 });
 
 describe("multi-repository session worktrees", () => {
+  it("preserves trusted initial instructions when expanding a v1 manifest", async () => {
+    const auth = repository("legacy-auth");
+    const audits = repository("legacy-audits");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({ dataRoot, sessionId: "session_v1", workspaceName: "Legacy", instructions: "Trusted original instructions.", repositories: [{ projectId: "auth", alias: "auth", sourcePath: auth.path, baseRef: "HEAD" }] });
+    writeFileSync(join(prepared.rootPath, "session.json"), JSON.stringify({ schemaVersion: 1, sessionId: "session_v1", workspaceName: "Legacy", repositories: prepared.repositories }));
+    await addRepository({ dataRoot, sessionId: "session_v1", operationKey: "legacy-expansion", instructions: "Trusted original instructions.", repository: { projectId: "audits", alias: "audits", sourcePath: audits.path, baseRef: "HEAD" } });
+    expect(readFileSync(join(prepared.rootPath, "AGENTS.md"), "utf8")).toContain("Trusted original instructions.");
+    expect(readSessionManifest(dataRoot, "session_v1").instructions).toBe("Trusted original instructions.");
+  });
+
+  it("accepts cleanup through the accumulated repository limit and refuses excess expansion before Git", async () => {
+    const auth = repository("bounded-auth");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({ dataRoot, sessionId: "session_bound", workspaceName: "Bounded", instructions: "", repositories: [{ projectId: "auth", alias: "auth", sourcePath: auth.path, baseRef: "HEAD" }] });
+    const repositories = Array.from({ length: 1024 }, (_, index) => ({ ...prepared.repositories[0]!, projectId: `project-${index}`, alias: `repo-${index}`, branch: `bb-workspace/session-bound/repo-${index}`, worktreePath: join(prepared.rootPath, `repos/repo-${index}`) }));
+    expect(hostContract.cleanup_session.input.safeParse({ sessionId: "session_bound", repositories }).success).toBe(true);
+    expect(hostContract.cleanup_session.input.safeParse({ sessionId: "session_bound", repositories: [...repositories, repositories[0]] }).success).toBe(false);
+    writeFileSync(join(prepared.rootPath, "session.json"), JSON.stringify({ ...readSessionManifest(dataRoot, "session_bound"), repositories }));
+    await expect(addRepository({ dataRoot, sessionId: "session_bound", operationKey: "too-many-repos", repository: { projectId: "extra", alias: "extra", sourcePath: "/missing/source", baseRef: "HEAD" } })).rejects.toThrow(/1024|limit/i);
+  });
   it("creates and validates a stable non-Git workspace anchor", async () => {
     const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
     roots.push(dataRoot);

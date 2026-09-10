@@ -1,5 +1,6 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { MAX_SESSION_REPOSITORIES } from "./contracts";
 
 export const preparedRepositorySchema = z.object({
   projectId: z.string(),
@@ -24,7 +25,7 @@ export const sessionManifestSchema = z.object({
   workspaceName: z.string(),
   instructions: z.string(),
   revision: z.number().int().positive(),
-  repositories: z.array(preparedRepositorySchema),
+  repositories: z.array(preparedRepositorySchema).max(MAX_SESSION_REPOSITORIES),
   operations: z.array(manifestOperationSchema),
 }).strict();
 
@@ -58,6 +59,7 @@ export const hostContract = defineRpcContract({
     input: z.object({
       sessionId: z.string().regex(/^session_[a-zA-Z0-9-]+$/),
       operationKey: z.string().min(8).max(200),
+      instructions: z.string(),
       repository: z.object({
         projectId: z.string().min(1),
         alias: z.string().regex(/^[a-z][a-z0-9-]{0,47}$/),
@@ -73,7 +75,7 @@ export const hostContract = defineRpcContract({
   cleanup_session: {
     input: z.object({
       sessionId: z.string(),
-      repositories: z.array(preparedRepositorySchema).min(1).max(20),
+      repositories: z.array(preparedRepositorySchema).min(1).max(MAX_SESSION_REPOSITORIES),
     }),
     output: z.object({ cleaned: z.literal(true) }),
   },

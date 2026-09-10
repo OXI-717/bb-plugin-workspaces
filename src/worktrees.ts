@@ -4,6 +4,7 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { MAX_SESSION_REPOSITORIES } from "./contracts";
 
 const execFileAsync = promisify(execFile);
 
@@ -142,7 +143,7 @@ function validatePreparedRepository(value: unknown, rootPath: string, sessionId:
 }
 
 /** Reads only a validated manifest below the host-owned data root. */
-export function readSessionManifest(dataRoot: string, sessionId: string): SessionManifest {
+export function readSessionManifest(dataRoot: string, sessionId: string, legacyInstructions = ""): SessionManifest {
   const { rootPath } = sessionPaths(dataRoot, sessionId);
   let raw: unknown;
   try {
@@ -154,6 +155,7 @@ export function readSessionManifest(dataRoot: string, sessionId: string): Sessio
   if (raw.sessionId !== sessionId) throw new Error("Session manifest does not match the requested session");
   assertString(raw.workspaceName, "workspaceName");
   if (!Array.isArray(raw.repositories)) throw new Error("Invalid session manifest repositories");
+  if (raw.repositories.length > MAX_SESSION_REPOSITORIES) throw new Error(`Session repository limit is ${MAX_SESSION_REPOSITORIES}`);
   const repositories = raw.repositories.map((repository) => validatePreparedRepository(repository, rootPath, sessionId));
   const aliases = new Set<string>();
   const projectIds = new Set<string>();
@@ -171,7 +173,7 @@ export function readSessionManifest(dataRoot: string, sessionId: string): Sessio
       owner: "bb-plugin-workspaces",
       sessionId,
       workspaceName: raw.workspaceName,
-      instructions: "",
+      instructions: legacyInstructions,
       revision: 1,
       repositories,
       operations: [],
@@ -390,6 +392,8 @@ export async function addRepository(input: {
   dataRoot: string;
   sessionId: string;
   operationKey: string;
+  /** Trusted immutable session snapshot, supplied by the server for v1 upgrades. */
+  instructions?: string;
   repository: PrepareRepository;
   /** Testable seams for post-side-effect failure and metadata recovery. */
   fileOperations?: SessionFileOperations;
@@ -399,7 +403,7 @@ export async function addRepository(input: {
   const repository = validateRequestedRepository(input.repository);
   const queueKey = `${resolve(input.dataRoot)}:${input.sessionId}`;
   return serializeSession(queueKey, async () => {
-    const manifest = readSessionManifest(input.dataRoot, input.sessionId);
+    const manifest = readSessionManifest(input.dataRoot, input.sessionId, input.instructions);
     const { rootPath, reposRoot } = sessionPaths(input.dataRoot, input.sessionId);
     const replayedOperation = manifest.operations.find((operation) => operation.key === input.operationKey);
     if (replayedOperation) {
@@ -409,6 +413,7 @@ export async function addRepository(input: {
     }
     const existingRepository = manifest.repositories.find((candidate) => candidate.projectId === repository.projectId);
     if (existingRepository) return { repository: existingRepository, manifestRevision: manifest.revision };
+    if (manifest.repositories.length >= MAX_SESSION_REPOSITORIES) throw new Error(`Session repository limit is ${MAX_SESSION_REPOSITORIES}`);
     if (manifest.repositories.some((candidate) => candidate.alias === repository.alias)) {
       throw new Error(`Duplicate repository alias: ${repository.alias}`);
     }

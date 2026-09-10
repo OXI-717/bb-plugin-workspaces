@@ -210,6 +210,48 @@ describe("Workspaces page", () => {
 });
 
 describe("Repositories panel", () => {
+  it("keeps a pending request retryable when reconciliation removes its option", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const calls: Array<{ requestKey: string }> = [];
+    let available = true;
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+      session_expansion_options: () => ({ session: activeSession, repositories: available ? [expansionOption] : [] }),
+      session_add_repository: (input: unknown) => { calls.push(input as typeof calls[number]); return { added: false, outcome: "pending", error: "Pending database recovery", alias: "gateway", worktreePath: null, policy: "ask", session: activeSession }; },
+    } });
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    fireEvent.click(await slot.findByRole("button", { name: "Add selected repository" }));
+    await slot.findByRole("alert");
+    available = false;
+    await slot.behavior.emitRealtime("workspaces-changed", { at: 9 });
+    expect(slot.getByLabelText("Repository to add")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Add selected repository" }));
+    await expect.poll(() => calls.length).toBe(2);
+    expect(calls[1]!.requestKey).toBe(calls[0]!.requestKey);
+    slot.lifecycle.unmount();
+  });
+  it.each(["failed", "pending", "cancelled"])("retains request identity after a resolved %s result and rotates on deliberate target change", async (outcome) => {
+    const app = await loadPluginApp(() => import("../app"));
+    const calls: Array<{ projectId: string; requestKey: string }> = [];
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+      session_expansion_options: () => ({ session: activeSession, repositories: [expansionOption, billingOption] }),
+      session_add_repository: (input: unknown) => { calls.push(input as typeof calls[number]); return { added: false, outcome, error: "Please retry this request", alias: "gateway", worktreePath: null, policy: "ask", session: activeSession }; },
+    } });
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    fireEvent.click(await slot.findByRole("button", { name: "Add selected repository" }));
+    await slot.findByRole("alert");
+    expect(slot.getByLabelText("Repository to add")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Add selected repository" }));
+    await expect.poll(() => calls.length).toBe(2);
+    expect(calls[1]!.requestKey).toBe(calls[0]!.requestKey);
+    await expect.poll(() => slot.getByRole("button", { name: "Add selected repository" }).hasAttribute("disabled")).toBe(false);
+    fireEvent.change(slot.getByLabelText("Repository to add"), { target: { value: "proj_billing" } });
+    fireEvent.click(slot.getByRole("button", { name: "Add selected repository" }));
+    await expect.poll(() => calls.length).toBe(3);
+    expect(calls[2]!.requestKey).not.toBe(calls[1]!.requestKey);
+    slot.lifecycle.unmount();
+  });
   it("adds a trusted eligible repository once and refreshes the displayed session", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const additions: Array<{ threadId: string; projectId: string; requestKey: string }> = [];
@@ -221,7 +263,7 @@ describe("Repositories panel", () => {
         session_expansion_options: () => ({ session: activeSession, repositories: [expansionOption] }),
         session_add_repository: (input: unknown) => {
           additions.push(input as { threadId: string; projectId: string; requestKey: string });
-          return { added: true, alias: "gateway", worktreePath: "/worktrees/gateway", policy: "ask", session: addedSession };
+          return { added: true, outcome: "provisioned", error: null, alias: "gateway", worktreePath: "/worktrees/gateway", policy: "ask", session: addedSession };
         },
       },
     });
@@ -250,7 +292,7 @@ describe("Repositories panel", () => {
         session_add_repository: async (input: unknown) => {
           additions.push(input as { threadId: string; projectId: string; requestKey: string });
           if (attempt++ === 0) throw new Error("Temporary host error");
-          return { added: true, alias: "gateway", worktreePath: "/worktrees/gateway", policy: "ask", session: activeSession };
+          return { added: true, outcome: "provisioned", error: null, alias: "gateway", worktreePath: "/worktrees/gateway", policy: "ask", session: activeSession };
         },
       },
     });

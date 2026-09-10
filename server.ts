@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { expansionApprovalResponseSchema, workspaceDraftSchema } from "./src/contracts";
+import { EXPANSION_ERROR_MAX_CHARS, expansionApprovalResponseSchema, workspaceDraftSchema } from "./src/contracts";
 import { hostContract } from "./src/host-contract";
 import { SessionExpansionService, type ExpansionResult } from "./src/session-expansion";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "./src/store";
@@ -20,7 +20,8 @@ const sessionRepositorySchema = z.object({
 const sessionExpansionSchema = z.object({
   id: z.string(), sessionId: z.string(), projectId: z.string(), alias: z.string(), reason: z.string(),
   requester: z.enum(["agent", "user", "reconcile"]), approvalMode: z.enum(["once", "auto", "manual", "reconciled"]),
-  outcome: z.enum(["pending", "cancelled", "failed", "provisioned"]), requestKey: z.string(), error: z.string().nullable(),
+  outcome: z.enum(["pending", "cancelled", "failed", "provisioned", "superseded"]), requestKey: z.string(), error: z.string().max(EXPANSION_ERROR_MAX_CHARS).nullable(),
+  phase: z.enum(["awaiting-approval", "approved", "provisioning", "uncertain"]).nullable(),
   createdAt: z.number().int(), updatedAt: z.number().int(),
 });
 const sessionSchema = z.object({
@@ -39,6 +40,8 @@ const expansionOptionSchema = z.object({
   projectId: z.string(), alias: z.string(), projectName: z.string(), sourcePath: z.string(),
 }).strict();
 const expansionResultSchema = z.object({
+  outcome: z.enum(["pending", "cancelled", "failed", "provisioned", "superseded"]),
+  error: z.string().max(EXPANSION_ERROR_MAX_CHARS).nullable(),
   added: z.boolean(), alias: z.string(), worktreePath: z.string().nullable(),
   policy: z.enum(["ask", "auto"]), session: sessionSchema,
 }).strict();
@@ -169,6 +172,8 @@ export default async function plugin(bb: BbPluginApi) {
     const { session } = result;
     return {
       added: result.added,
+      outcome: result.outcome,
+      error: result.error,
       alias: result.alias,
       worktreePath: result.added ? session.repositories.find((repository) => repository.alias === result.alias)?.worktreePath ?? null : null,
       policy: result.policy,
@@ -212,14 +217,23 @@ export default async function plugin(bb: BbPluginApi) {
       const result = resultWithSession(await expansion.requestFromAgent({
         threadId, alias: repository, reason, requestKey: `agent-${randomUUID()}`, signal,
       }));
-      return result.added
-        ? `Repository ${result.alias} is ready at ${result.worktreePath}. Re-read session.json and continue there.`
-        : "Repository request was cancelled; the session was not changed.";
+      if (result.outcome === "provisioned") return `Repository ${result.alias} is ready at ${result.worktreePath}. Re-read session.json and continue there.`;
+      if (result.outcome === "superseded") return `Repository ${result.alias} is already ready at ${result.worktreePath}; another request completed the addition. Re-read session.json and continue there.`;
+      if (result.outcome === "cancelled") return "Repository request was cancelled; the session was not changed.";
+      if (result.outcome === "pending") return `Repository ${result.alias} is pending recovery. Refresh the Repositories panel before proceeding.${result.error ? ` ${result.error}` : ""}`;
+      return `Repository ${result.alias} request failed: ${result.error ?? "Unknown error"}`;
     },
   });
 
   bb.agents.configure((context) => {
-    if (context.origin.pluginId !== "workspaces" || !store.hasSessionForThread(context.thread.id)) {
+    const storedSession = store.getSessionByThreadId(context.thread.id);
+    // spawn can resolve first-dispatch configuration before returning the thread ID.
+    const bootstrap = context.project.id === store.getWorkspaceProjectId()
+      && context.environment.workspaceProvisionType === "unmanaged"
+      && store.listSessions().some((session) => session.state === "preparing" && session.threadId === null
+        && session.ownerProjectId === context.project.id && session.hostId === context.host.id
+        && session.rootPath !== null && session.rootPath === context.environment.path);
+    if (context.origin.pluginId !== "workspaces" || context.origin.kind !== null || (!storedSession && !bootstrap)) {
       return { tools: [], skills: [] };
     }
     return {

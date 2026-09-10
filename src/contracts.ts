@@ -67,7 +67,11 @@ export type SessionRepository = RepositoryDraft & {
 export type ExpansionPolicy = "ask" | "auto";
 export type ExpansionRequester = "agent" | "user" | "reconcile";
 export type ExpansionApprovalMode = "once" | "auto" | "manual" | "reconciled";
-export type ExpansionOutcome = "pending" | "cancelled" | "failed" | "provisioned";
+export type ExpansionOutcome = "pending" | "cancelled" | "failed" | "provisioned" | "superseded";
+export type ExpansionPhase = "awaiting-approval" | "approved" | "provisioning" | "uncertain";
+export const EXPANSION_ERROR_MAX_CHARS = 500;
+/** Total append-only membership, including the initial selection. */
+export const MAX_SESSION_REPOSITORIES = 1024;
 
 export type SessionExpansion = {
   id: string;
@@ -78,6 +82,7 @@ export type SessionExpansion = {
   requester: ExpansionRequester;
   approvalMode: ExpansionApprovalMode;
   outcome: ExpansionOutcome;
+  phase: ExpansionPhase | null;
   requestKey: string;
   error: string | null;
   createdAt: number;

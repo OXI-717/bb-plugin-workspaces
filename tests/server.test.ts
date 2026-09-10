@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "../server";
+import { WorkspaceStore } from "../src/store";
+import type { SessionSnapshot } from "../src/contracts";
+import type { PreparedRepository } from "../src/worktrees";
 
 const projects = [
   {
@@ -41,7 +44,118 @@ const projects = [
   },
 ];
 
+async function boundaryFixture() {
+  const available = [...projects];
+  let mode: "okay" | "failed" = "okay";
+  let readFailure = false;
+  const repositories: PreparedRepository[] = [];
+  const operations: Array<{ key: string; projectId: string; alias: string }> = [];
+  let sessionId = "";
+  let firstTools: string[] = [];
+  let firstSkills: string[] = [];
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "workspaces", agentSkillIds: ["multi-repo-workspaces"], experimental_hostEntry: true,
+    sdk: {
+      projects: { list: async () => available, create: async ({ name, source }) => {
+        const created = { ...projects[0]!, id: "proj_workspaces", name, sources: [{ ...projects[0]!.sources[0]!, projectId: "proj_workspaces", path: source.path }] };
+        available.push(created); return created;
+      } },
+      threads: { spawn: async (input) => {
+        const configuration = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+          thread: { id: "thr_first" }, project: { id: input.projectId }, origin: { kind: null, pluginId: "workspaces" },
+          host: { id: "host_local" }, environment: { path: `/sessions/${sessionId}`, workspaceProvisionType: "unmanaged" },
+        }));
+        firstTools = configuration.tools.map((tool) => tool.name); firstSkills = configuration.skills;
+        return makeThreadResponse({ id: "thr_first", projectId: input.projectId });
+      } },
+    },
+    experimental_callHostRpc: async ({ method, input }) => {
+      if (method === "ensure_anchor") return { path: "/plugin/anchor" };
+      if (method === "prepare_session") {
+        const request = input as { sessionId: string; repositories: PreparedRepository[] };
+        sessionId = request.sessionId;
+        repositories.push(...request.repositories.map((repo) => ({ ...repo, baseCommit: "abc123", branch: `bb-workspace/${sessionId}/${repo.alias}`, worktreePath: `/sessions/${sessionId}/repos/${repo.alias}` })));
+        return { rootPath: `/sessions/${sessionId}`, repositories };
+      }
+      if (method === "read_session") {
+        if (readFailure) throw new Error("manifest temporarily unavailable");
+        return { schemaVersion: 2, owner: "bb-plugin-workspaces", sessionId, workspaceName: "Boundary", instructions: "Trusted snapshot.", revision: repositories.length, repositories, operations };
+      }
+      if (method === "add_repository") {
+        if (mode === "failed") throw new Error("host failed " + "x".repeat(1000));
+        const request = input as { operationKey: string; repository: PreparedRepository };
+        const repository = { ...request.repository, baseCommit: "def456", branch: `bb-workspace/${sessionId}/${request.repository.alias}`, worktreePath: `/sessions/${sessionId}/repos/${request.repository.alias}` };
+        repositories.push(repository); operations.push({ key: request.operationKey, projectId: repository.projectId, alias: repository.alias });
+        return { repository, manifestRevision: repositories.length };
+      }
+      throw new Error(`Unexpected ${method}`);
+    },
+  });
+  await plugin(bb);
+  const workspace = await harness.behavior.callRpc("workspace_create", { name: "Boundary", description: "", instructions: "Trusted snapshot.", repositories: [{ projectId: "proj_auth", alias: "identity" }, { projectId: "proj_gateway", alias: "gateway" }] }) as { id: string; revision: number };
+  const session = await harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId: "host_local", projectIds: ["proj_auth"], prompt: "Boundary check", requestKey: "boundary-launch" }) as SessionSnapshot;
+  return { bb, harness, session, firstTools, firstSkills, setReadFailure: (value: boolean) => { readFailure = value; }, setFailure: () => { mode = "failed"; } };
+}
+
 describe("Workspaces plugin server", () => {
+  it("exposes pending recovery through RPC then settles on replay", async () => {
+    const fixture = await boundaryFixture();
+    fixture.setReadFailure(true);
+    const append = vi.spyOn(WorkspaceStore.prototype, "appendProvisionedRepository").mockImplementation(() => { throw new Error("database unavailable"); });
+    try {
+      const result = await fixture.harness.behavior.callRpc("session_add_repository", { threadId: "thr_first", projectId: "proj_gateway", requestKey: "boundary-pending" }) as { outcome: string; error: string };
+      expect(result.outcome).toBe("pending"); expect(result.error).toMatch(/pending database recovery/);
+      fixture.setReadFailure(false);
+      const replay = await fixture.harness.behavior.callRpc("session_add_repository", { threadId: "thr_first", projectId: "proj_gateway", requestKey: "boundary-pending" });
+      expect(replay).toMatchObject({ outcome: "provisioned", error: null });
+    } finally { append.mockRestore(); }
+  });
+  it("selects workspace tools on the first dispatch before spawn returns and excludes other origins and owners", async () => {
+    const fixture = await boundaryFixture();
+    expect(fixture.firstTools).toContain("workspace_add_repository");
+    expect(fixture.firstSkills).toContain("multi-repo-workspaces");
+    for (const context of [
+      { project: { id: "proj_auth" }, origin: { kind: null, pluginId: "workspaces" } },
+      { project: { id: "proj_workspaces" }, origin: { kind: "fork" as const, pluginId: "side-chat" } },
+      { project: { id: "proj_workspaces" }, origin: { kind: null, pluginId: null } },
+    ]) expect(await fixture.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ ...context, thread: { id: "thr_unrelated" } }))).toMatchObject({ tools: [], skills: [] });
+    await expect(fixture.harness.behavior.callAgentTool("workspace_add_repository", { repository: "gateway", reason: "Needed" }, { threadId: "thr_unrelated" })).rejects.toThrow(/workspace session/);
+  });
+
+  it("preserves failed outcomes and bounded errors in RPC and tool output", async () => {
+    const fixture = await boundaryFixture();
+    fixture.setFailure();
+    const result = await fixture.harness.behavior.callRpc("session_add_repository", { threadId: "thr_first", projectId: "proj_gateway", requestKey: "boundary-failed" }) as { outcome: string; error: string };
+    expect(result.outcome).toBe("failed"); expect(result.error).toHaveLength(500);
+    const tool = fixture.harness.behavior.callAgentTool("workspace_add_repository", { repository: "gateway", reason: "Needed" }, { threadId: "thr_first" });
+    await vi.waitFor(() => expect(fixture.harness.inspection.pendingInteractions).toHaveLength(1));
+    fixture.harness.behavior.submitInteraction(fixture.harness.inspection.pendingInteractions[0]!.id, { action: "add-once" });
+    expect(await tool).toMatch(/failed.*host failed/i);
+  });
+
+  it.each(["cancel", "malformed", "abort"])("preserves %s approval outcome without host mutation", async (action) => {
+    const fixture = await boundaryFixture();
+    const controller = new AbortController();
+    const tool = fixture.harness.behavior.callAgentTool("workspace_add_repository", { repository: "gateway", reason: "Needed" }, { threadId: "thr_first", signal: controller.signal });
+    await vi.waitFor(() => expect(fixture.harness.inspection.pendingInteractions).toHaveLength(1));
+    if (action === "abort") controller.abort();
+    else fixture.harness.behavior.submitInteraction(fixture.harness.inspection.pendingInteractions[0]!.id, action === "cancel" ? { action: "cancel" } : { action: "add-once", unexpected: true });
+    expect(await tool).toMatch(action === "malformed" ? /failed/i : /cancelled/i);
+    expect(fixture.harness.inspection.experimental_hostRpcCalls.filter((call) => call.method === "add_repository")).toHaveLength(0);
+  });
+
+  it("recovers approved pending RPC requests and normal listing journal rows", async () => {
+    const fixture = await boundaryFixture();
+    const store = new WorkspaceStore(fixture.bb.storage.database());
+    store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_gateway", alias: "gateway", reason: "Needed", requester: "user", approvalMode: "manual", requestKey: "boundary-recover" });
+    expect(await fixture.harness.behavior.callRpc("session_add_repository", { threadId: "thr_first", projectId: "proj_gateway", requestKey: "boundary-recover" })).toMatchObject({ outcome: "provisioned", error: null, added: true });
+    fixture.bb.storage.database().prepare("UPDATE session_expansions SET outcome = 'pending' WHERE request_key = ?").run("boundary-recover");
+    const dashboard = await fixture.harness.behavior.callRpc("dashboard", null) as { sessions: SessionSnapshot[] };
+    expect(dashboard.sessions[0]?.expansions).toMatchObject([{ outcome: "provisioned" }]);
+    fixture.bb.storage.database().prepare("UPDATE session_expansions SET outcome = 'pending' WHERE request_key = ?").run("boundary-recover");
+    const cli = await fixture.harness.behavior.runCli(["sessions", "--json"]);
+    expect(JSON.parse(cli.stdout!).at(0).expansions).toMatchObject([{ outcome: "provisioned" }]);
+  });
   it("creates groups without mutating BB projects", async () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "workspaces",
@@ -483,6 +597,7 @@ describe("Workspaces plugin server", () => {
       input: {
         sessionId,
         operationKey: expect.stringMatching(/^agent-/),
+        instructions: "Coordinate the services.",
         repository: { projectId: "proj_gateway", alias: "gateway", sourcePath: "/repos/gateway", baseRef: "HEAD" },
       },
     });
@@ -502,6 +617,7 @@ describe("Workspaces plugin server", () => {
       input: {
         sessionId,
         operationKey: "manual-billing-1",
+        instructions: "Coordinate the services.",
         repository: { projectId: "proj_billing", alias: "billing", sourcePath: "/repos/billing", baseRef: "HEAD" },
       },
     });

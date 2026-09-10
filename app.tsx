@@ -242,6 +242,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [adding, setAdding] = useState(false);
   const requestKey = useRef<string | null>(null);
+  const submittedOption = useRef<ExpansionOption | null>(null);
   const generation = useRef(0);
   const latestOptionsRequest = useRef(0);
   const currentThreadId = useRef(threadId);
@@ -253,7 +254,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const makeRequestKey = () => `manual-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const closeAddForm = useCallback((clearRequestKey = true) => {
     addFormOpen.current = false; selectedProjectIdRef.current = "";
-    if (clearRequestKey) requestKey.current = null;
+    if (clearRequestKey) { requestKey.current = null; submittedOption.current = null; }
     setShowAddForm(false); setSelectedProjectId("");
   }, []);
   useEffect(() => {
@@ -261,6 +262,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
     latestOptionsRequest.current += 1;
     latestOptions.current = []; latestOptionsSessionState.current = null;
     addPending.current = false; requestKey.current = null;
+    submittedOption.current = null;
     addFormOpen.current = false; selectedProjectIdRef.current = "";
     setOptions(null); setOptionsSessionState(null); setOptionsError(null); setShowAddForm(false); setSelectedProjectId(""); setAdding(false);
   }, [threadId]);
@@ -273,7 +275,9 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
       if (generation.current !== requestGeneration || currentThreadId.current !== threadId || latestOptionsRequest.current !== requestSequence) return;
       latestOptions.current = result.repositories; latestOptionsSessionState.current = result.session.state;
       setOptions(result.repositories); setOptionsSessionState(result.session.state); setOptionsError(null);
-      if (result.session.state !== "active" || (addFormOpen.current && !result.repositories.some((option) => option.projectId === selectedProjectIdRef.current))) closeAddForm();
+      const completed = result.session.expansions.some((expansion) => expansion.requestKey === requestKey.current && (expansion.outcome === "provisioned" || expansion.outcome === "superseded"));
+      if (completed) closeAddForm();
+      else if (result.session.state !== "active" || (addFormOpen.current && !submittedOption.current && !result.repositories.some((option) => option.projectId === selectedProjectIdRef.current))) closeAddForm(false);
     } catch (cause) {
       if (generation.current === requestGeneration && currentThreadId.current === threadId && latestOptionsRequest.current === requestSequence) setOptionsError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -289,21 +293,28 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
     if (session?.state !== "active" || latestOptionsSessionState.current !== "active" || !options?.length) return;
     if (requestKey.current === null) requestKey.current = makeRequestKey();
     const projectId = options[0]!.projectId;
+    if (submittedOption.current && submittedOption.current.projectId !== projectId) { requestKey.current = makeRequestKey(); submittedOption.current = null; }
     selectedProjectIdRef.current = projectId; addFormOpen.current = true;
     setSelectedProjectId(projectId); setShowAddForm(true); setOptionsError(null);
   };
   const addRepository = async (event: FormEvent) => {
     event.preventDefault();
-    const option = latestOptions.current.find((candidate) => candidate.projectId === selectedProjectIdRef.current);
+    const option = latestOptions.current.find((candidate) => candidate.projectId === selectedProjectIdRef.current) ?? submittedOption.current;
     if (addPending.current || session?.state !== "active" || latestOptionsSessionState.current !== "active" || !option || requestKey.current === null) return;
     const requestGeneration = generation.current;
     const key = requestKey.current;
+    submittedOption.current = option;
     addPending.current = true;
     setAdding(true); setOptionsError(null);
     try {
-      await rpc.call("session_add_repository", { threadId, projectId: option.projectId, requestKey: key });
+      const result = await rpc.call("session_add_repository", { threadId, projectId: option.projectId, requestKey: key });
       if (generation.current !== requestGeneration || currentThreadId.current !== threadId) return;
+      if (result.outcome !== "provisioned" && result.outcome !== "superseded") {
+        setOptionsError(result.error ?? (result.outcome === "pending" ? "Repository addition is pending recovery. Retry this request." : result.outcome === "cancelled" ? "Repository request was cancelled." : "Repository addition failed."));
+        return;
+      }
       requestKey.current = makeRequestKey();
+      submittedOption.current = null;
       closeAddForm(false);
       load(); await loadOptions();
     } catch (cause) {
@@ -316,8 +327,15 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   if (!dashboard) return <p className="text-sm text-muted-foreground">Loading repositories…</p>;
   if (!session) return <Empty>This thread was not launched from a multi-repository workspace session.</Empty>;
   if (session.state === "cleaned") return <Empty>This session's worktrees were removed. Its repository branches are still available.</Empty>;
+  const changeTarget = (projectId: string) => {
+    if (selectedProjectIdRef.current !== projectId) { requestKey.current = makeRequestKey(); submittedOption.current = null; }
+    selectedProjectIdRef.current = projectId;
+    setSelectedProjectId(projectId);
+  };
   const activeForAddition = session.state === "active" && optionsSessionState === "active";
-  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Editing this workspace changes future repository eligibility; it does not change this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">All current workspace repositories are already available.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => { selectedProjectIdRef.current = event.target.value; setSelectedProjectId(event.target.value); }} disabled={adding}>{options?.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</select></label><Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button></form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p></div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
+  const displayedOptions = submittedOption.current && !options?.some((option) => option.projectId === submittedOption.current!.projectId)
+    ? [...(options ?? []), submittedOption.current] : options;
+  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Editing this workspace changes future repository eligibility; it does not change this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">All current workspace repositories are already available.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{displayedOptions?.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</select></label><Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button></form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p></div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
 }
 
 export default definePluginApp((app) => {

@@ -104,6 +104,87 @@ function addSecondActiveSession(fixture: ReturnType<typeof createFixture>) {
 }
 
 describe("SessionExpansionService", () => {
+  it.each(["approved", "provisioning", "uncertain"])("resumes orphaned %s work during a normal read", async (phase) => {
+    const fixture = createFixture();
+    fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "agent", approvalMode: "once", requestKey: "orphaned-operation" });
+    fixture.db.prepare("UPDATE session_expansions SET phase = ? WHERE request_key = ?").run(phase, "orphaned-operation");
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }]);
+    expect((await new SessionExpansionService(fixture.deps).reconcileSession(fixture.session.id)).expansions).toMatchObject([{ outcome: "provisioned" }]);
+    expect(fixture.approvals).toHaveLength(0);
+    expect(fixture.hostAdds).toHaveLength(1);
+  });
+
+  it.each(["awaiting-approval", null])("cancels abandoned approval phase %s on normal read without approving it", async (phase) => {
+    const fixture = createFixture({ policy: "auto" });
+    fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "agent", approvalMode: "once", requestKey: "orphaned-approval" });
+    fixture.db.prepare("UPDATE session_expansions SET phase = ? WHERE request_key = ?").run(phase, "orphaned-approval");
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }]);
+    expect((await new SessionExpansionService(fixture.deps).reconcileSession(fixture.session.id)).expansions).toMatchObject([{ outcome: "cancelled" }]);
+    expect(fixture.approvals).toHaveLength(0); expect(fixture.hostAdds).toHaveLength(0);
+  });
+
+  it("does not cancel an in-flight approval during dashboard reconciliation", async () => {
+    const fixture = createFixture();
+    let decide!: (value: unknown) => void;
+    let seen!: () => void;
+    const ready = new Promise<void>((resolve) => { seen = resolve; });
+    fixture.deps.requestApproval = async () => new Promise((resolve) => { decide = resolve; seen(); });
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }]);
+    const service = new SessionExpansionService(fixture.deps);
+    const request = service.requestFromAgent({ threadId: "thr_1", alias: "audits", reason: "Required", requestKey: "live-approval" });
+    await ready;
+    expect((await service.reconcileSession(fixture.session.id)).expansions).toMatchObject([{ outcome: "pending", phase: "awaiting-approval" }]);
+    decide({ action: "add-once" }); expect(await request).toMatchObject({ outcome: "provisioned" });
+  });
+  it("rejects an accumulated repository overflow before provisioning", async () => {
+    const fixture = createFixture();
+    const repositories = [...fixture.session.repositories, ...Array.from({ length: 1023 }, (_, index) => ({ projectId: `extra-${index}`, alias: `extra-${index}` }))];
+    fixture.db.prepare("UPDATE sessions SET repositories_json = ? WHERE id = ?").run(JSON.stringify(repositories), fixture.session.id);
+    await expect(new SessionExpansionService(fixture.deps).addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey: "overflow-add" })).rejects.toThrow(/1024|limit/i);
+    expect(fixture.hostAdds).toHaveLength(0);
+  });
+  it("returns explicit failed outcome and bounded nullable error", async () => {
+    const fixture = createFixture();
+    fixture.deps.addRepository = async () => { throw new Error("x".repeat(1000)); };
+    const result = await new SessionExpansionService(fixture.deps).addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey: "bounded-failure" });
+    expect(result).toMatchObject({ outcome: "failed", error: "x".repeat(500) });
+    expect(result.session.expansions[0]?.error).toHaveLength(500);
+  });
+
+  it("settles concurrent different keys for the same repository successfully", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    const service = new SessionExpansionService(fixture.deps);
+    const results = await Promise.all(["concurrent-one", "concurrent-two"].map((requestKey) => service.addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey })));
+    expect(results.every((result) => result.added)).toBe(true);
+    expect(fixture.store.getSession(fixture.session.id).expansions.map((row) => row.outcome).sort()).toEqual(["provisioned", "superseded"]);
+  });
+
+  it("settles matching manifest operations during ordinary reconciliation", async () => {
+    const fixture = createFixture();
+    fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "user", approvalMode: "manual", requestKey: "read-recovery" });
+    fixture.deps.readSession = async (sessionId) => ({ ...manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_audits", alias: "audits" }]), operations: [{ key: "read-recovery", projectId: "proj_audits", alias: "audits" }] });
+    expect((await new SessionExpansionService(fixture.deps).reconcileSession(fixture.session.id)).expansions).toMatchObject([{ outcome: "provisioned" }]);
+  });
+
+  it.each(["approved", "provisioning", "uncertain", null])("recovers a crash before host mutation from phase %s", async (phase) => {
+    const fixture = createFixture();
+    fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "user", approvalMode: "manual", requestKey: "crash-recovery" });
+    const columns = fixture.db.pragma("table_info(session_expansions)") as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "phase")) fixture.db.prepare("UPDATE session_expansions SET phase = ? WHERE request_key = ?").run(phase, "crash-recovery");
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }]);
+    expect(await new SessionExpansionService(fixture.deps).addManually({ threadId: "thr_1", projectId: "proj_audits", requestKey: "crash-recovery" })).toMatchObject({ added: true, outcome: "provisioned", error: null });
+    expect(fixture.hostAdds).toHaveLength(1);
+  });
+
+  it("asks again for a phase-less agent crash even if session policy is now auto", async () => {
+    const fixture = createFixture({ policy: "auto" });
+    fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "agent", approvalMode: "once", requestKey: "approval-crash" });
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }]);
+    fixture.deps.requestApproval = async (payload) => { fixture.approvals.push(payload); return { action: "cancel" }; };
+    expect(await new SessionExpansionService(fixture.deps).requestFromAgent({ threadId: "thr_1", alias: "audits", reason: "Required", requestKey: "approval-crash" })).toMatchObject({ outcome: "cancelled", error: null });
+    expect(fixture.approvals).toHaveLength(1);
+    expect(fixture.hostAdds).toHaveLength(0);
+  });
   it("asks then adds once through the trusted option", async () => {
     const fixture = createFixture();
     const service = new SessionExpansionService(fixture.deps);

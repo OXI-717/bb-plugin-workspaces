@@ -9,6 +9,50 @@ const createStore = (): { db: Database.Database; store: WorkspaceStore } => {
 };
 
 describe("WorkspaceStore", () => {
+  it("bounds historical journal errors when hydrating migrated rows", () => {
+    const { db, store } = createStore();
+    const workspace = store.create({ name: "Legacy", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    const session = store.createSessionSnapshot(workspace.id, 1, workspace.repositories);
+    store.beginExpansion({ sessionId: session.id, projectId: "b", alias: "billing", reason: "Required", requester: "user", approvalMode: "manual", requestKey: "legacy-error" });
+    db.prepare("UPDATE session_expansions SET outcome = 'failed', error = ? WHERE request_key = ?").run("x".repeat(1000), "legacy-error");
+    expect(store.getSession(session.id).expansions[0]?.error).toHaveLength(500);
+  });
+  it.each(["append", "reconcile"])("freezes legacy initial membership before %s", (method) => {
+    const { db, store } = createStore();
+    const workspace = store.create({ name: "Legacy", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    const session = store.createSessionSnapshot(workspace.id, 1, workspace.repositories);
+    db.prepare("UPDATE sessions SET initial_repositories_json = NULL WHERE id = ?").run(session.id);
+    const added = { projectId: "b", alias: "billing" };
+    if (method === "append") {
+      store.beginExpansion({ sessionId: session.id, ...added, reason: "Required", requester: "user", approvalMode: "manual", requestKey: "legacy-add" });
+      store.appendProvisionedRepository({ sessionId: session.id, requestKey: "legacy-add", repository: added, manifestRevision: 2 });
+    } else store.reconcileRepositories(session.id, [...session.repositories, added], 2);
+    expect(store.getSession(session.id).initialRepositories).toEqual(session.repositories);
+    expect(JSON.parse((db.prepare("SELECT initial_repositories_json AS value FROM sessions WHERE id = ?").get(session.id) as { value: string }).value)).toEqual(session.repositories);
+  });
+
+  it("settles a second operation for one repository without a second provisioned journal row", () => {
+    const { store } = createStore();
+    const workspace = store.create({ name: "Peers", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    const session = store.createSessionSnapshot(workspace.id, 1, workspace.repositories);
+    for (const requestKey of ["first-add", "second-add"]) {
+      store.beginExpansion({ sessionId: session.id, projectId: "b", alias: "billing", reason: "Required", requester: "user", approvalMode: "manual", requestKey });
+      store.appendProvisionedRepository({ sessionId: session.id, requestKey, repository: { projectId: "b", alias: "billing" }, manifestRevision: 2 });
+    }
+    expect(store.getSession(session.id).expansions.map((row) => row.outcome).sort()).toEqual(["provisioned", "superseded"]);
+  });
+
+  it("finalizes prepared initial commits once without rewriting active history", () => {
+    const { store } = createStore();
+    const workspace = store.create({ name: "Peers", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    const session = store.createSessionSnapshot(workspace.id, 1, workspace.repositories);
+    store.updateSession(session.id, { state: "preparing" });
+    store.setSessionRepositories(session.id, [{ projectId: "a", alias: "api", baseCommit: "abc123" }]);
+    expect(store.getSession(session.id).initialRepositories).toMatchObject([{ baseCommit: "abc123" }]);
+    store.updateSession(session.id, { state: "active" });
+    store.setSessionRepositories(session.id, [{ projectId: "a", alias: "api", baseCommit: "changed" }]);
+    expect(store.getSession(session.id).initialRepositories).toMatchObject([{ baseCommit: "abc123" }]);
+  });
   it("keeps one repository in multiple workspaces and snapshots sessions", () => {
     const { store } = createStore();
     const first = store.create({
