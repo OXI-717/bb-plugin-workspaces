@@ -324,6 +324,11 @@ export class WorkspaceStore {
     })();
   }
 
+  getExpansionByRequestKey(requestKey: string): SessionExpansion | null {
+    const row = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow | undefined;
+    return row ? this.hydrateExpansion(row) : null;
+  }
+
   finishExpansion(requestKey: string, outcome: "cancelled" | "failed", error?: string): SessionExpansion {
     return this.db.transaction(() => {
       const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow | undefined;
@@ -334,6 +339,29 @@ export class WorkspaceStore {
         .run(outcome, error ?? null, now, requestKey);
       return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow);
     })();
+  }
+
+  finishProvisionedExpansion(requestKey: string): SessionExpansion {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow | undefined;
+      if (!existing) throw new Error(`Expansion ${requestKey} was not found`);
+      if (existing.outcome !== "pending") return this.hydrateExpansion(existing);
+      const now = Date.now();
+      this.db.prepare("UPDATE session_expansions SET outcome = 'provisioned', error = NULL, updated_at = ? WHERE request_key = ?")
+        .run(now, requestKey);
+      return this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(requestKey) as ExpansionRow);
+    })();
+  }
+
+  setExpansionApprovalMode(requestKey: string, approvalMode: ExpansionApprovalMode): SessionExpansion {
+    const result = this.db.prepare("UPDATE session_expansions SET approval_mode = ?, updated_at = ? WHERE request_key = ? AND outcome = 'pending'")
+      .run(approvalMode, Date.now(), requestKey);
+    if (result.changes !== 1) {
+      const existing = this.getExpansionByRequestKey(requestKey);
+      if (!existing) throw new Error(`Expansion ${requestKey} was not found`);
+      return existing;
+    }
+    return this.getExpansionByRequestKey(requestKey)!;
   }
 
   appendProvisionedRepository(input: AppendProvisionedRepositoryInput): SessionSnapshot {

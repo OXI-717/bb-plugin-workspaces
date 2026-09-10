@@ -28,6 +28,21 @@ export const workspaceDraftSchema = z.object({
 export type RepositoryDraft = z.infer<typeof repositoryDraftSchema>;
 export type WorkspaceDraft = z.infer<typeof workspaceDraftSchema>;
 
+export const expansionApprovalPayloadSchema = z.object({
+  sessionId: z.string(),
+  workspaceName: z.string(),
+  repositoryAlias: z.string(),
+  repositoryName: z.string(),
+  reason: z.string().min(1).max(2_000),
+}).strict();
+
+export const expansionApprovalResponseSchema = z.object({
+  action: z.enum(["add-once", "add-and-auto", "cancel"]),
+}).strict();
+
+export type ExpansionApprovalPayload = z.infer<typeof expansionApprovalPayloadSchema>;
+export type ExpansionApprovalResponse = z.infer<typeof expansionApprovalResponseSchema>;
+
 export type WorkspaceRepository = RepositoryDraft & { ordinal: number };
 
 export type Workspace = WorkspaceDraft & {
