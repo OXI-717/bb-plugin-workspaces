@@ -265,6 +265,34 @@ describe("WorkspaceStore", () => {
     expect(store.updateSession(session.id, { ownerProjectId: null })).toMatchObject({ ownerProjectId: null });
   });
 
+  it("preserves an owner project when ownerProjectId is explicitly undefined", () => {
+    const { store } = createStore();
+    const workspace = store.create({
+      name: "Platform",
+      description: "",
+      instructions: "",
+      repositories: [{ projectId: "proj_api", alias: "api" }],
+    });
+    const session = store.createSessionSnapshot(workspace.id, workspace.revision, [{ projectId: "proj_api", alias: "api" }]);
+    store.updateSession(session.id, { ownerProjectId: "proj_owner" });
+
+    expect(store.updateSession(session.id, { ownerProjectId: undefined })).toMatchObject({ ownerProjectId: "proj_owner" });
+  });
+
+  it("preserves an owner project when legacy primaryProjectId is explicitly undefined", () => {
+    const { store } = createStore();
+    const workspace = store.create({
+      name: "Platform",
+      description: "",
+      instructions: "",
+      repositories: [{ projectId: "proj_api", alias: "api" }],
+    });
+    const session = store.createSessionSnapshot(workspace.id, workspace.revision, [{ projectId: "proj_api", alias: "api" }]);
+    store.updateSession(session.id, { ownerProjectId: "proj_owner" });
+
+    expect(store.updateSession(session.id, { primaryProjectId: undefined })).toMatchObject({ ownerProjectId: "proj_owner" });
+  });
+
   it("reconciles only manifest additions and never permits membership removal or revision rollback", () => {
     const { store } = createStore();
     const workspace = store.create({

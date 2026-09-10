@@ -275,10 +275,10 @@ export class WorkspaceStore {
     patch: Partial<Pick<SessionSnapshot, "state" | "hostId" | "rootPath" | "ownerProjectId" | "threadId" | "error">> & { primaryProjectId?: string | null },
   ): SessionSnapshot {
     const current = this.getSession(id);
-    const ownerProjectId = Object.hasOwn(patch, "ownerProjectId")
-      ? patch.ownerProjectId ?? null
-      : Object.hasOwn(patch, "primaryProjectId")
-        ? patch.primaryProjectId ?? null
+    const ownerProjectId = patch.ownerProjectId !== undefined
+      ? patch.ownerProjectId
+      : patch.primaryProjectId !== undefined
+        ? patch.primaryProjectId
         : current.ownerProjectId;
     const next = { ...current, ...patch, ownerProjectId, updatedAt: Date.now() };
     this.db.prepare(`UPDATE sessions SET state = ?, host_id = ?, root_path = ?, primary_project_id = ?,
