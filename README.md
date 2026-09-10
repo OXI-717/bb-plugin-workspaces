@@ -5,16 +5,16 @@ BB Workspaces groups existing BB projects and launches one agent thread across a
 The plugin follows a simple model:
 
 - A **workspace** is a reusable, many-to-many grouping of BB projects. It does not modify or replace those projects.
-- A **session** is an immutable snapshot of a workspace revision and repository selection.
+- A **session** keeps its initial selection as immutable historical context, while its active repository scope can expand append-only.
 - Every selected repository gets its own Git worktree under one session root.
-- The thread belongs to a chosen primary BB project, while its unmanaged working directory is the common session root.
+- New workspace threads are owned by the neutral `🧩 Workspaces` BB project; no real repository is primary. The thread's unmanaged working directory is the common session root.
 - Repository branches survive cleanup. Worktrees are removed only after the session is archived, every working tree is clean, and each checkout is still on its recorded session branch.
 
 ## Use it
 
 Open **Workspaces** in BB's navigation, create a workspace, and select the existing BB projects that belong together. To start a task:
 
-1. Choose the repositories needed for this task. The plugin remembers this selection per workspace.
+1. Choose the repositories needed for this task. The first task selects all workspace repositories; later tasks remember the user's last subset. This is the session's initial selection and remains historical context even if the active scope later expands.
 2. Enter the task prompt and select **Start thread**.
 
 All selected projects must have a source on the same BB host. The new thread starts at a root shaped like:
@@ -28,7 +28,11 @@ session root/
     api-gateway/
 ```
 
-The thread's **Repositories** panel reports each checkout independently, including changed files and commits ahead of the session base.
+The thread's **Repositories** panel reports each checkout independently, including changed files and commits ahead of the session base. Its **Add repository** action expands only the active session (append-only); it does not edit the saved workspace. Use **Edit** on the workspace itself to change membership for future tasks and for eligible later additions.
+
+Agent requests to add a repository default to approval. Choosing auto-approval applies only to that session and only to repositories that are current members of the saved workspace on the session's host; it never changes the workspace default or other sessions.
+
+Git History support for sessions with multiple repositories comes from a generic companion plugin enhancement. Ordinary single-repository threads retain their existing Git History behavior.
 
 When work is complete, commit or otherwise resolve changes and archive the session. **Remove worktrees** performs a full preflight before deleting anything. Commits remain on the generated branches. If any checkout has uncommitted changes or was switched to another branch, cleanup stops and preserves the whole session for recovery.
 
@@ -63,5 +67,5 @@ The implementation uses only the public BB Plugin SDK and includes a public-SDK 
 - Worktree paths and manifests are validated before cleanup.
 - Cleanup never uses `--force` and never deletes the generated branches.
 - Launches have an idempotency key, preventing UI retries from creating duplicate threads.
-- BB requires a project owner for every thread, so the plugin assigns the first selected workspace project internally and keeps that implementation detail out of the UI.
+- BB requires a project owner for every thread, so the plugin uses the neutral `🧩 Workspaces` owner and keeps that implementation detail out of the UI. Real repositories remain peers rather than a primary repository.
 - If thread creation fails after checkout preparation, the failed session remains visible with its worktrees intact.
