@@ -217,6 +217,54 @@ describe("WorkspaceStore", () => {
     )).toMatchObject({ id: session.id, workspaceName: "Authentication" });
   });
 
+  it("replays a completed provision request after a newer manifest revision", () => {
+    const { store } = createStore();
+    const workspace = store.create({
+      name: "Platform",
+      description: "",
+      instructions: "",
+      repositories: [{ projectId: "proj_api", alias: "api" }],
+    });
+    const session = store.createSessionSnapshot(workspace.id, workspace.revision, [{ projectId: "proj_api", alias: "api" }]);
+    store.beginExpansion({
+      sessionId: session.id, projectId: "proj_docs", alias: "docs", reason: "Docs", requester: "agent", approvalMode: "once", requestKey: "provision_docs",
+    });
+    store.appendProvisionedRepository({
+      sessionId: session.id, requestKey: "provision_docs", repository: { projectId: "proj_docs", alias: "docs" }, manifestRevision: 2,
+    });
+    store.beginExpansion({
+      sessionId: session.id, projectId: "proj_worker", alias: "worker", reason: "Worker", requester: "agent", approvalMode: "once", requestKey: "provision_worker",
+    });
+    store.appendProvisionedRepository({
+      sessionId: session.id, requestKey: "provision_worker", repository: { projectId: "proj_worker", alias: "worker" }, manifestRevision: 3,
+    });
+
+    expect(store.appendProvisionedRepository({
+      sessionId: session.id, requestKey: "provision_docs", repository: { projectId: "proj_docs", alias: "docs" }, manifestRevision: 2,
+    })).toMatchObject({
+      manifestRevision: 3,
+      repositories: [
+        { projectId: "proj_api", alias: "api" },
+        { projectId: "proj_docs", alias: "docs" },
+        { projectId: "proj_worker", alias: "worker" },
+      ],
+    });
+  });
+
+  it("clears an owner project when ownerProjectId is explicitly null", () => {
+    const { store } = createStore();
+    const workspace = store.create({
+      name: "Platform",
+      description: "",
+      instructions: "",
+      repositories: [{ projectId: "proj_api", alias: "api" }],
+    });
+    const session = store.createSessionSnapshot(workspace.id, workspace.revision, [{ projectId: "proj_api", alias: "api" }]);
+    store.updateSession(session.id, { ownerProjectId: "proj_owner" });
+
+    expect(store.updateSession(session.id, { ownerProjectId: null })).toMatchObject({ ownerProjectId: null });
+  });
+
   it("reconciles only manifest additions and never permits membership removal or revision rollback", () => {
     const { store } = createStore();
     const workspace = store.create({

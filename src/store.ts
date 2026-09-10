@@ -275,7 +275,11 @@ export class WorkspaceStore {
     patch: Partial<Pick<SessionSnapshot, "state" | "hostId" | "rootPath" | "ownerProjectId" | "threadId" | "error">> & { primaryProjectId?: string | null },
   ): SessionSnapshot {
     const current = this.getSession(id);
-    const ownerProjectId = patch.ownerProjectId ?? patch.primaryProjectId ?? current.ownerProjectId;
+    const ownerProjectId = Object.hasOwn(patch, "ownerProjectId")
+      ? patch.ownerProjectId ?? null
+      : Object.hasOwn(patch, "primaryProjectId")
+        ? patch.primaryProjectId ?? null
+        : current.ownerProjectId;
     const next = { ...current, ...patch, ownerProjectId, updatedAt: Date.now() };
     this.db.prepare(`UPDATE sessions SET state = ?, host_id = ?, root_path = ?, primary_project_id = ?,
       thread_id = ?, error = ?, updated_at = ? WHERE id = ?`)
@@ -326,7 +330,6 @@ export class WorkspaceStore {
     this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(input.sessionId) as SessionRow | undefined;
       if (!row) throw new Error(`Session ${input.sessionId} was not found`);
-      if (input.manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
       const expansion = this.db.prepare("SELECT * FROM session_expansions WHERE request_key = ?").get(input.requestKey) as ExpansionRow | undefined;
       if (!expansion || expansion.session_id !== input.sessionId) throw new Error(`Expansion ${input.requestKey} was not found for session ${input.sessionId}`);
       if (expansion.project_id !== input.repository.projectId || expansion.alias !== input.repository.alias) {
@@ -334,6 +337,7 @@ export class WorkspaceStore {
       }
       if (expansion.outcome !== "pending" && expansion.outcome !== "provisioned") throw new Error("Expansion is no longer pending");
       if (expansion.outcome === "provisioned") return;
+      if (input.manifestRevision < (row.manifest_revision ?? 1)) throw new Error("Manifest revision cannot go backward");
       const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
       const existing = repositories.find((repository) => repository.projectId === input.repository.projectId);
       if (existing && existing.alias !== input.repository.alias) throw new Error("Cannot replace an existing session repository");
