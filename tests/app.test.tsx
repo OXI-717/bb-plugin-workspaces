@@ -186,6 +186,51 @@ describe("Workspaces page", () => {
     slot.lifecycle.unmount();
   });
 
+  it("searches hundreds of repositories and keeps selection visible across filters", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const projects = Array.from({ length: 250 }, (_, index) => ({
+      ...project,
+      id: `proj_${index}`,
+      name: `service-${String(index).padStart(3, "0")}`,
+      sources: [{ ...project.sources[0]!, id: `src_${index}`, path: `/repos/group-${Math.floor(index / 10)}/service-${index}` }],
+    }));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [], sessions: [], projects }),
+    } });
+
+    fireEvent.click(await slot.findByRole("button", { name: /new workspace/i }));
+    expect(await slot.findByText("0 / 100 selected")).toBeTruthy();
+    fireEvent.change(slot.getByRole("searchbox", { name: "Search repositories" }), { target: { value: "group-24" } });
+    expect(slot.getAllByRole("checkbox")).toHaveLength(10);
+    fireEvent.click(slot.getByRole("button", { name: "Select visible" }));
+    expect(slot.getByText("10 / 100 selected")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Selected repositories" }));
+    expect(slot.getAllByRole("checkbox")).toHaveLength(10);
+    expect(slot.getByText("service-240")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Clear visible" }));
+    expect(slot.getByText("0 / 100 selected")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("enforces the workspace repository limit during bulk selection", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const projects = Array.from({ length: 125 }, (_, index) => ({
+      ...project,
+      id: `proj_${index}`,
+      name: `service-${index}`,
+      sources: [{ ...project.sources[0]!, id: `src_${index}`, path: `/repos/service-${index}` }],
+    }));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [], sessions: [], projects }),
+    } });
+
+    fireEvent.click(await slot.findByRole("button", { name: /new workspace/i }));
+    fireEvent.click(await slot.findByRole("button", { name: "Select visible" }));
+    expect(slot.getByText("100 / 100 selected")).toBeTruthy();
+    expect(slot.getByText("25 visible repositories were not selected because a workspace can contain at most 100.")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
   it("selects every workspace repository initially and remembers a changed subset", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const rpc = {

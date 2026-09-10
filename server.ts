@@ -5,7 +5,7 @@ import { EXPANSION_ERROR_MAX_CHARS, expansionApprovalResponseSchema, workspaceDr
 import { hostContract } from "./src/host-contract";
 import { SessionExpansionService, type ExpansionResult } from "./src/session-expansion";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "./src/store";
-import { ensureWorkspaceProject, type ProjectRecord } from "./src/workspace-project";
+import { ensureWorkspaceProject, renameStoredWorkspaceProject, type ProjectRecord } from "./src/workspace-project";
 
 const repositorySchema = z.object({ projectId: z.string(), alias: z.string(), ordinal: z.number().int() });
 const workspaceSchema = z.object({
@@ -138,7 +138,14 @@ export default async function plugin(bb: BbPluginApi) {
     listProjects: async () => (await allProjects()).map((project) => ({ id: project.id, name: project.name, sources: project.sources })),
     createProject: async (input: { name: string; source: { type: "local_path"; hostId: string; path: string } }) => toProjectRecord(await bb.sdk.projects.create(input)),
     addSource: async (projectId: string, input: { type: "local_path"; hostId: string; path: string }) => { await bb.sdk.projects.sources.add({ projectId, ...input }); },
+    updateProjectName: async (projectId: string, name: string) => { await bb.sdk.projects.update({ projectId, name }); },
   };
+
+  try {
+    await renameStoredWorkspaceProject(workspaceProjectDeps);
+  } catch (cause) {
+    bb.log.warn(`Workspaces could not rename its legacy synthetic project: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
 
   async function workspaceProject(hostId: string): Promise<string> {
     return ensureWorkspaceProject(workspaceProjectDeps, hostId);
@@ -300,7 +307,7 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.spawn({
           projectId: workspaceOwnerProjectId,
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: prepared.rootPath } },
-          prompt, title: `🧩 ${workspace.name} · ${prompt.slice(0, 72)}`, visibility: "visible",
+          prompt, title: `🧵 ${workspace.name} · ${prompt.slice(0, 72)}`, visibility: "visible",
         });
         session = store.updateSession(session.id, { state: "active", threadId: thread.id }); changed(); return session;
       } catch (error) {

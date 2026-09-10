@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc, type PluginPendingInteractionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
+import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -50,7 +50,51 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
   const [description, setDescription] = useState(initial?.description ?? "");
   const [instructions, setInstructions] = useState(initial?.instructions ?? "");
   const [selected, setSelected] = useState(() => new Set(initial?.repositories.map((repo) => repo.projectId) ?? []));
+  const [repositoryQuery, setRepositoryQuery] = useState("");
+  const [repositoryFilter, setRepositoryFilter] = useState<"all" | "selected">("all");
+  const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const visibleProjects = useMemo(() => {
+    const query = repositoryQuery.trim().toLocaleLowerCase();
+    return projects
+      .filter((project) => repositoryFilter === "all" || selected.has(project.id))
+      .filter((project) => !query || project.name.toLocaleLowerCase().includes(query)
+        || project.sources.some((source) => source.path.toLocaleLowerCase().includes(query)))
+      .sort((left, right) => Number(selected.has(right.id)) - Number(selected.has(left.id))
+        || left.name.localeCompare(right.name));
+  }, [projects, repositoryFilter, repositoryQuery, selected]);
+  const toggleRepository = (projectId: string, checked: boolean) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (!checked) next.delete(projectId);
+      else if (next.size < MAX_WORKSPACE_REPOSITORIES) next.add(projectId);
+      else setSelectionMessage(`A workspace can contain at most ${MAX_WORKSPACE_REPOSITORIES} repositories.`);
+      return next;
+    });
+  };
+  const selectVisible = () => {
+    setSelected((current) => {
+      const next = new Set(current);
+      let skipped = 0;
+      for (const project of visibleProjects) {
+        if (next.has(project.id)) continue;
+        if (next.size >= MAX_WORKSPACE_REPOSITORIES) skipped += 1;
+        else next.add(project.id);
+      }
+      setSelectionMessage(skipped > 0
+        ? `${skipped} visible repositories were not selected because a workspace can contain at most ${MAX_WORKSPACE_REPOSITORIES}.`
+        : null);
+      return next;
+    });
+  };
+  const clearVisible = () => {
+    setSelected((current) => {
+      const next = new Set(current);
+      visibleProjects.forEach((project) => next.delete(project.id));
+      return next;
+    });
+    setSelectionMessage(null);
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!name.trim() || selected.size === 0 || pending) return;
@@ -74,12 +118,20 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-name">Workspace name</label><Input id="workspace-name" aria-label="Workspace name" value={name} onChange={(event) => setName(event.target.value)} autoFocus /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-description">Description</label><Input id="workspace-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-instructions">Shared instructions</label><textarea id="workspace-instructions" className={`${fieldClass} min-h-24 resize-y`} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Context that applies whenever these repositories are used together" /></div>
-      <fieldset><legend className="mb-2 text-sm font-medium">Repositories</legend><div className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-border p-2">
-        {projects.map((project) => <label key={project.id} className="flex cursor-pointer items-start gap-3 rounded px-2 py-2 hover:bg-muted/60">
-          <Checkbox checked={selected.has(project.id)} onCheckedChange={(checked) => setSelected((current) => { const next = new Set(current); checked === true ? next.add(project.id) : next.delete(project.id); return next; })} aria-label={project.name} />
-          <span className="min-w-0"><span className="block text-sm font-medium">{project.name}</span><span className="block truncate text-xs text-muted-foreground">{project.sources[0]?.path ?? "No source configured"}</span></span>
-        </label>)}
-      </div></fieldset>
+      <fieldset className="space-y-2"><legend className="sr-only">Repositories</legend><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">Repositories</span><span className="text-xs tabular-nums text-muted-foreground">{selected.size} / {MAX_WORKSPACE_REPOSITORIES} selected</span></div>
+        <Input type="search" aria-label="Search repositories" placeholder="Search by repository name or path…" value={repositoryQuery} onChange={(event) => setRepositoryQuery(event.target.value)} />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex gap-1" aria-label="Repository filters"><Button type="button" size="sm" variant={repositoryFilter === "all" ? "secondary" : "ghost"} onClick={() => setRepositoryFilter("all")}>All repositories</Button><Button type="button" size="sm" variant={repositoryFilter === "selected" ? "secondary" : "ghost"} onClick={() => setRepositoryFilter("selected")}>Selected repositories</Button></div>
+          <div className="flex gap-1"><Button type="button" size="sm" variant="ghost" onClick={selectVisible} disabled={visibleProjects.length === 0}>Select visible</Button><Button type="button" size="sm" variant="ghost" onClick={clearVisible} disabled={visibleProjects.every((project) => !selected.has(project.id))}>Clear visible</Button></div>
+        </div>
+        {selectionMessage ? <p role="status" className="text-xs text-muted-foreground">{selectionMessage}</p> : null}
+        <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+          {visibleProjects.length === 0 ? <p className="px-2 py-6 text-center text-sm text-muted-foreground">No repositories match this view.</p> : visibleProjects.map((project) => <label key={project.id} className="flex cursor-pointer items-start gap-3 rounded px-2 py-2 hover:bg-muted/60">
+            <Checkbox checked={selected.has(project.id)} disabled={!selected.has(project.id) && selected.size >= MAX_WORKSPACE_REPOSITORIES} onCheckedChange={(checked) => toggleRepository(project.id, checked === true)} aria-label={project.name} />
+            <span className="min-w-0"><span className="block text-sm font-medium">{project.name}</span><span className="block truncate text-xs text-muted-foreground">{project.sources[0]?.path ?? "No source configured"}</span></span>
+          </label>)}
+        </div>
+      </fieldset>
       <div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button><Button type="submit" disabled={pending || !name.trim() || selected.size === 0}>{initial ? "Save workspace" : "Create workspace"}</Button></div>
     </form>
   );

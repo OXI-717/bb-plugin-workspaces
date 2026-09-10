@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export const MAX_WORKSPACE_REPOSITORIES = 100;
+
 export const repositoryDraftSchema = z.object({
   projectId: z.string().trim().min(1),
   alias: z.string().trim().regex(/^[a-z][a-z0-9-]{0,47}$/, "Invalid repository alias"),
@@ -9,7 +11,7 @@ export const workspaceDraftSchema = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().trim().max(2_000),
   instructions: z.string().max(16_000),
-  repositories: z.array(repositoryDraftSchema).min(1).max(100),
+  repositories: z.array(repositoryDraftSchema).min(1).max(MAX_WORKSPACE_REPOSITORIES),
 }).superRefine((value, context) => {
   const aliases = new Set<string>();
   const projects = new Set<string>();

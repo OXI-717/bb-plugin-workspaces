@@ -332,7 +332,7 @@ describe("Workspaces plugin server", () => {
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
       projectId: "proj_workspaces",
       prompt: "Change the auth contract in both services.",
-      title: "🧩 Authentication · Change the auth contract in both services.",
+      title: "🧵 Authentication · Change the auth contract in both services.",
       environment: {
         type: "host",
         hostId: "host_local",

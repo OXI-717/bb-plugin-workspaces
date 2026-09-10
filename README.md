@@ -7,12 +7,12 @@ The plugin follows a simple model:
 - A **workspace** is a reusable, many-to-many grouping of BB projects. It does not modify or replace those projects.
 - A **session** keeps its initial selection as immutable historical context, while its active repository scope can expand append-only.
 - Every selected repository gets its own Git worktree under one session root.
-- New workspace threads are owned by the neutral `🧩 Workspaces` BB project; no real repository is primary. The thread's unmanaged working directory is the common session root.
+- New workspace threads are owned by the neutral `🗂️ Workspace Hub` BB project; no real repository is primary. Thread titles use `🧵` so the owner and task are visually distinct. The thread's unmanaged working directory is the common session root.
 - Repository branches survive cleanup. Worktrees are removed only after the session is archived, every working tree is clean, and each checkout is still on its recorded session branch.
 
 ## Use it
 
-Open **Workspaces** in BB's navigation, create a workspace, and select the existing BB projects that belong together. To start a task:
+Open **Workspaces** in BB's navigation, create a workspace, and select the existing BB projects that belong together. The picker searches hundreds of projects by name or path, filters to selected projects, and supports selecting or clearing visible results while enforcing the 100-repository workspace limit. To start a task:
 
 1. Choose the repositories needed for this task. The first task selects all workspace repositories; later tasks remember the user's last subset. This is the session's initial selection and remains historical context even if the active scope later expands.
 2. Enter the task prompt and select **Start thread**.
@@ -71,5 +71,5 @@ The implementation uses only the public BB Plugin SDK and includes a public-SDK 
 - Worktree paths and manifests are validated before cleanup.
 - Cleanup never uses `--force` and never deletes the generated branches.
 - Launches have an idempotency key, preventing UI retries from creating duplicate threads.
-- BB requires a project owner for every thread, so the plugin uses the neutral `🧩 Workspaces` owner and keeps that implementation detail out of the UI. Real repositories remain peers rather than a primary repository.
+- BB requires a project owner for every thread, so the plugin uses the neutral `🗂️ Workspace Hub` owner and keeps that implementation detail out of the UI. Real repositories remain peers rather than a primary repository.
 - If thread creation fails after checkout preparation, the failed session remains visible with its worktrees intact.
