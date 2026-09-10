@@ -28,6 +28,7 @@ export type WorkspaceProjectDeps = {
 export const WORKSPACE_PROJECT_NAME = "🧩 Workspaces";
 
 const inFlightByDeps = new WeakMap<WorkspaceProjectDeps, Map<string, Promise<string>>>();
+const discoveryLockByDeps = new WeakMap<WorkspaceProjectDeps, Promise<void>>();
 
 export function ensureWorkspaceProject(deps: WorkspaceProjectDeps, hostId: string): Promise<string> {
   let inFlight = inFlightByDeps.get(deps);
@@ -44,22 +45,39 @@ export function ensureWorkspaceProject(deps: WorkspaceProjectDeps, hostId: strin
 
 async function resolveWorkspaceProject(deps: WorkspaceProjectDeps, hostId: string): Promise<string> {
   const anchor = await deps.ensureAnchor(hostId);
-  const source: LocalPathSourceInput = { type: "local_path", hostId, path: anchor.path };
-  const storedId = deps.getStoredProjectId();
-  let project = storedId ? await deps.getProject(storedId) : null;
+  return withDiscoveryLock(deps, async () => {
+    const source: LocalPathSourceInput = { type: "local_path", hostId, path: anchor.path };
+    const storedId = deps.getStoredProjectId();
+    let project = storedId ? await deps.getProject(storedId) : null;
 
-  if (!project) {
-    project = (await deps.listProjects()).find((candidate) => candidate.sources.some(
-      (candidateSource) => candidateSource.hostId === hostId && candidateSource.path === anchor.path,
-    )) ?? null;
+    if (!project) {
+      project = (await deps.listProjects()).find((candidate) => candidate.sources.some(
+        (candidateSource) => candidateSource.hostId === hostId && candidateSource.path === anchor.path,
+      )) ?? null;
+    }
+
+    if (!project) {
+      project = await deps.createProject({ name: WORKSPACE_PROJECT_NAME, source });
+    } else if (!project.sources.some((candidate) => candidate.hostId === hostId && candidate.path === anchor.path)) {
+      await deps.addSource(project.id, source);
+    }
+
+    deps.setStoredProjectId(project.id);
+    return project.id;
+  });
+}
+
+async function withDiscoveryLock<T>(deps: WorkspaceProjectDeps, operation: () => Promise<T>): Promise<T> {
+  let release: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const previous = discoveryLockByDeps.get(deps) ?? Promise.resolve();
+  const lock = previous.catch(() => undefined).then(() => gate);
+  discoveryLockByDeps.set(deps, lock);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release!();
+    if (discoveryLockByDeps.get(deps) === lock) discoveryLockByDeps.delete(deps);
   }
-
-  if (!project) {
-    project = await deps.createProject({ name: WORKSPACE_PROJECT_NAME, source });
-  } else if (!project.sources.some((candidate) => candidate.hostId === hostId && candidate.path === anchor.path)) {
-    await deps.addSource(project.id, source);
-  }
-
-  deps.setStoredProjectId(project.id);
-  return project.id;
 }

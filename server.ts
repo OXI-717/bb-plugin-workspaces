@@ -154,6 +154,9 @@ export default async function plugin(bb: BbPluginApi) {
         return { ...repository, sourceId: source.id, sourcePath: source.path, baseRef: "HEAD" };
       });
       const workspaceOwnerProjectId = await workspaceProject(hostId);
+      if (selected.some((repository) => repository.projectId === workspaceOwnerProjectId)) {
+        throw new Error("The synthetic Workspaces project cannot be selected as a repository");
+      }
       let session = store.createSessionSnapshot(workspaceId, expectedRevision, selected, requestKey);
       session = store.updateSession(session.id, { state: "preparing", hostId, ownerProjectId: workspaceOwnerProjectId, error: null });
       changed();

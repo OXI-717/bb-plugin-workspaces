@@ -42,7 +42,7 @@ function createDeps(initialProjects: ProjectRecord[], storedProjectId: string | 
       target.sources.push(source(input.hostId, input.path));
     },
   };
-  return { deps, calls, getStored: () => stored };
+  return { deps, calls, getStored: () => stored, getProjects: () => projects };
 }
 
 describe("ensureWorkspaceProject", () => {
@@ -97,5 +97,19 @@ describe("ensureWorkspaceProject", () => {
     ])).resolves.toEqual(["proj_workspaces", "proj_workspaces"]);
     expect(calls.create).toHaveLength(1);
     expect(calls.addSource).toHaveLength(0);
+  });
+
+  it("creates one project when different hosts ensure concurrently", async () => {
+    const { deps, calls, getProjects } = createDeps([]);
+
+    await expect(Promise.all([
+      ensureWorkspaceProject(deps, "host_local"),
+      ensureWorkspaceProject(deps, "host_remote"),
+    ])).resolves.toEqual(["proj_workspaces", "proj_workspaces"]);
+
+    expect(calls.create).toHaveLength(1);
+    expect(calls.addSource).toHaveLength(1);
+    expect(getProjects().find((candidate) => candidate.id === "proj_workspaces")?.sources
+      .map((candidate) => candidate.hostId).sort()).toEqual(["host_local", "host_remote"]);
   });
 });

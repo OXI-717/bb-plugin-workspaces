@@ -198,4 +198,106 @@ describe("Workspaces plugin server", () => {
       ],
     });
   });
+
+  it("does not prepare a session when a deleted owner recovers to a selected repository", async () => {
+    const hostCalls: string[] = [];
+    const recoveredProject = {
+      id: "proj_recovered",
+      kind: "standard" as const,
+      name: "workspace-anchor",
+      gitRemoteUrl: "https://example.invalid/workspace-anchor.git",
+      createdAt: 1,
+      updatedAt: 1,
+      sources: [{
+        id: "src_recovered",
+        projectId: "proj_recovered",
+        type: "local_path" as const,
+        hostId: "host_local",
+        path: "/repos/recovered",
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    };
+    const availableProjects = [...projects, recoveredProject];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "workspaces",
+      sdk: {
+        projects: {
+          list: async () => availableProjects,
+          create: async ({ name, source }) => {
+            const created = {
+              id: "proj_deleted",
+              kind: "standard" as const,
+              name,
+              gitRemoteUrl: "https://example.invalid/workspaces.git",
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [{
+                id: "src_deleted",
+                projectId: "proj_deleted",
+                type: "local_path" as const,
+                hostId: source.hostId,
+                path: source.path,
+                isDefault: true,
+                createdAt: 1,
+                updatedAt: 1,
+              }],
+            };
+            availableProjects.push(created);
+            return created;
+          },
+        },
+        threads: { spawn: async () => makeThreadResponse({ id: "thr_owner", projectId: "proj_deleted" }) },
+      },
+      experimental_hostEntry: true,
+      experimental_callHostRpc: async ({ method, input }) => {
+        hostCalls.push(method);
+        if (method === "ensure_anchor") return { path: "/plugin/anchor" };
+        if (method !== "prepare_session") throw new Error(`Unexpected host method: ${method}`);
+        const request = input as { sessionId: string; repositories: Array<{ projectId: string; alias: string; sourcePath: string; baseRef: string }> };
+        return {
+          rootPath: `/plugin-data/sessions/${request.sessionId}`,
+          repositories: request.repositories.map((repository) => ({
+            ...repository,
+            baseCommit: `commit-${repository.alias}`,
+            branch: `bb-workspace/${request.sessionId}/${repository.alias}`,
+            worktreePath: `/plugin-data/sessions/${request.sessionId}/repos/${repository.alias}`,
+          })),
+        };
+      },
+    });
+    await plugin(bb);
+    const workspace = await harness.behavior.callRpc("workspace_create", {
+      name: "Authentication",
+      description: "",
+      instructions: "Read each repo's AGENTS.md.",
+      repositories: [
+        { projectId: "proj_auth", alias: "identity" },
+        { projectId: "proj_recovered", alias: "anchor" },
+      ],
+    }) as { id: string; revision: number };
+
+    await harness.behavior.callRpc("session_start", {
+      workspaceId: workspace.id,
+      expectedRevision: workspace.revision,
+      hostId: "host_local",
+      projectIds: ["proj_auth"],
+      prompt: "Start with identity.",
+      requestKey: "request-initial-owner",
+    });
+    availableProjects.splice(availableProjects.findIndex((project) => project.id === "proj_deleted"), 1);
+    recoveredProject.sources[0]!.path = "/plugin/anchor";
+
+    await expect(harness.behavior.callRpc("session_start", {
+      workspaceId: workspace.id,
+      expectedRevision: workspace.revision,
+      hostId: "host_local",
+      projectIds: ["proj_recovered"],
+      prompt: "Work on the anchor.",
+      requestKey: "request-recovered-owner",
+    })).rejects.toThrow("cannot be selected as a repository");
+    expect(hostCalls.filter((method) => method === "prepare_session")).toHaveLength(1);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
 });
