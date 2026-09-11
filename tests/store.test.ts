@@ -74,7 +74,7 @@ describe("WorkspaceStore", () => {
 
     const session = store.createSessionSnapshot(first.id, first.revision, [
       { projectId: "proj_auth", alias: "auth" },
-    ]);
+    ], "named-session-request", "Rotate signing keys");
     store.update(first.id, first.revision, {
       ...first,
       name: "Identity",
@@ -82,10 +82,12 @@ describe("WorkspaceStore", () => {
     });
 
     expect(store.getSession(session.id)).toMatchObject({
+      name: "Rotate signing keys",
       workspaceName: "Authentication",
       instructions: "Run contract tests.",
       repositories: [{ projectId: "proj_auth", alias: "auth" }],
     });
+    expect(store.renameSession(session.id, "Verify rollout").name).toBe("Verify rollout");
   });
 
   it("rejects stale revisions, invalid aliases, and duplicate aliases", () => {
@@ -164,6 +166,7 @@ describe("WorkspaceStore", () => {
     const store = new WorkspaceStore(db);
 
     expect(store.getSession("session_legacy")).toMatchObject({
+      name: null,
       initialRepositories: [{ projectId: "proj_auth", alias: "auth" }],
       expansionPolicy: "ask",
       expansions: [],

@@ -93,6 +93,7 @@ export type SessionExpansion = {
 
 export type SessionSnapshot = {
   id: string;
+  name: string | null;
   workspaceId: string | null;
   workspaceName: string;
   workspaceRevision: number;

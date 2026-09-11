@@ -44,7 +44,7 @@ const projects = [
   },
 ];
 
-async function boundaryFixture() {
+async function boundaryFixture(updateThread = true) {
   const available = [...projects];
   let mode: "okay" | "failed" = "okay";
   let readFailure = false;
@@ -60,7 +60,7 @@ async function boundaryFixture() {
         const created = { ...projects[0]!, id: "proj_workspaces", name, sources: [{ ...projects[0]!.sources[0]!, projectId: "proj_workspaces", path: source.path }] };
         available.push(created); return created;
       } },
-      threads: { spawn: async (input) => {
+      threads: { update: async () => { if (!updateThread) throw new Error("thread no longer exists"); }, spawn: async (input) => {
         const configuration = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
           thread: { id: "thr_first" }, project: { id: input.projectId }, origin: { kind: null, pluginId: "workspaces" },
           host: { id: "host_local" }, environment: { path: `/sessions/${sessionId}`, workspaceProvisionType: "unmanaged" },
@@ -93,11 +93,31 @@ async function boundaryFixture() {
   });
   await plugin(bb);
   const workspace = await harness.behavior.callRpc("workspace_create", { name: "Boundary", description: "", instructions: "Trusted snapshot.", repositories: [{ projectId: "proj_auth", alias: "identity" }, { projectId: "proj_gateway", alias: "gateway" }] }) as { id: string; revision: number };
-  const session = await harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId: "host_local", projectIds: ["proj_auth"], prompt: "Boundary check", requestKey: "boundary-launch" }) as SessionSnapshot;
+  const session = await harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId: "host_local", projectIds: ["proj_auth"], prompt: "\n  Boundary   check  \nInspect details", requestKey: "boundary-launch" }) as SessionSnapshot;
   return { bb, harness, session, firstTools, firstSkills, setReadFailure: (value: boolean) => { readFailure = value; }, setFailure: () => { mode = "failed"; } };
 }
 
 describe("Workspaces plugin server", () => {
+  it("derives a session name and synchronizes later renames to the BB thread", async () => {
+    const fixture = await boundaryFixture();
+    expect(fixture.session.name).toBe("Boundary check");
+
+    const renamed = await fixture.harness.behavior.callRpc("session_rename", { id: fixture.session.id, name: "Verify gateway rollout" }) as { session: SessionSnapshot; threadTitleUpdated: boolean };
+
+    expect(renamed).toMatchObject({ session: { name: "Verify gateway rollout" }, threadTitleUpdated: true });
+    expect(fixture.harness.inspection.sdk.callsTo("threads.update").at(-1)?.[0]).toEqual({
+      threadId: "thr_first",
+      title: "Boundary · Verify gateway rollout",
+    });
+  });
+
+  it("keeps a renamed session when its BB thread no longer exists", async () => {
+    const fixture = await boundaryFixture(false);
+    const renamed = await fixture.harness.behavior.callRpc("session_rename", { id: fixture.session.id, name: "Local history label" }) as { session: SessionSnapshot; threadTitleUpdated: boolean };
+
+    expect(renamed).toMatchObject({ session: { name: "Local history label" }, threadTitleUpdated: false });
+    expect((await fixture.harness.behavior.callRpc("dashboard", null) as { sessions: SessionSnapshot[] }).sessions[0]?.name).toBe("Local history label");
+  });
   it("exposes pending recovery through RPC then settles on replay", async () => {
     const fixture = await boundaryFixture();
     fixture.setReadFailure(true);
@@ -312,18 +332,21 @@ describe("Workspaces plugin server", () => {
       hostId: "host_local",
       projectIds: ["proj_gateway", "proj_auth"],
       prompt: "Change the auth contract in both services.",
+      name: "Auth contract rollout",
       requestKey: "request-auth-contract",
-    }) as { id: string; state: string; threadId: string };
+    }) as { id: string; name: string; state: string; threadId: string };
     const retried = await harness.behavior.callRpc("session_start", {
       workspaceId: workspace.id,
       expectedRevision: workspace.revision,
       hostId: "host_local",
       projectIds: ["proj_gateway", "proj_auth"],
       prompt: "Change the auth contract in both services.",
+      name: "Ignored retry name",
       requestKey: "request-auth-contract",
     }) as { id: string };
 
     expect(session).toMatchObject({
+      name: "Auth contract rollout",
       state: "active",
       threadId: "thr_multi",
       ownerProjectId: "proj_workspaces",
@@ -332,7 +355,7 @@ describe("Workspaces plugin server", () => {
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
       projectId: "proj_workspaces",
       prompt: "Change the auth contract in both services.",
-      title: "🧵 Authentication · Change the auth contract in both services.",
+      title: "Authentication · Auth contract rollout",
       environment: {
         type: "host",
         hostId: "host_local",

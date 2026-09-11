@@ -26,8 +26,8 @@ export type WorkspaceProjectDeps = {
   updateProjectName(projectId: string, name: string): Promise<void>;
 };
 
-export const WORKSPACE_PROJECT_NAME = "🗂️ Workspace Hub";
-export const LEGACY_WORKSPACE_PROJECT_NAME = "🧩 Workspaces";
+export const WORKSPACE_PROJECT_NAME = "Workspace Hub";
+export const LEGACY_WORKSPACE_PROJECT_NAMES = new Set(["🧩 Workspaces", "🗂️ Workspace Hub"]);
 
 const inFlightByDeps = new WeakMap<WorkspaceProjectDeps, Map<string, Promise<string>>>();
 const discoveryLockByDeps = new WeakMap<WorkspaceProjectDeps, Promise<void>>();
@@ -64,7 +64,7 @@ async function resolveWorkspaceProject(deps: WorkspaceProjectDeps, hostId: strin
       await deps.addSource(project.id, source);
     }
 
-    if (project.name === LEGACY_WORKSPACE_PROJECT_NAME) {
+    if (LEGACY_WORKSPACE_PROJECT_NAMES.has(project.name)) {
       await deps.updateProjectName(project.id, WORKSPACE_PROJECT_NAME);
     }
 
@@ -77,7 +77,7 @@ export async function renameStoredWorkspaceProject(deps: WorkspaceProjectDeps): 
   const projectId = deps.getStoredProjectId();
   if (!projectId) return;
   const project = await deps.getProject(projectId);
-  if (project?.name === LEGACY_WORKSPACE_PROJECT_NAME) {
+  if (project && LEGACY_WORKSPACE_PROJECT_NAMES.has(project.name)) {
     await deps.updateProjectName(projectId, WORKSPACE_PROJECT_NAME);
   }
 }

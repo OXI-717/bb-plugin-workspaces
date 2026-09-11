@@ -25,7 +25,7 @@ const sessionExpansionSchema = z.object({
   createdAt: z.number().int(), updatedAt: z.number().int(),
 });
 const sessionSchema = z.object({
-  id: z.string(), workspaceId: z.string().nullable(), workspaceName: z.string(), workspaceRevision: z.number().int(),
+  id: z.string(), name: z.string().nullable(), workspaceId: z.string().nullable(), workspaceName: z.string(), workspaceRevision: z.number().int(),
   instructions: z.string(), repositories: z.array(sessionRepositorySchema), initialRepositories: z.array(sessionRepositorySchema),
   expansionPolicy: z.enum(["ask", "auto"]), expansions: z.array(sessionExpansionSchema), manifestRevision: z.number().int(),
   state: z.enum(["draft", "preparing", "active", "failed", "archived", "cleaned"]),
@@ -57,11 +57,16 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       workspaceId: z.string(), expectedRevision: z.number().int(), hostId: z.string(),
       projectIds: z.array(z.string()).min(1).max(20), prompt: z.string().trim().min(1).max(100_000),
+      name: z.string().trim().min(1).max(80).optional(),
       requestKey: z.string().min(8).max(200),
     }),
     output: sessionSchema,
   },
   session_archive: { input: z.object({ id: z.string() }), output: sessionSchema },
+  session_rename: {
+    input: z.object({ id: z.string(), name: z.string().trim().min(1).max(80) }).strict(),
+    output: z.object({ session: sessionSchema, threadTitleUpdated: z.boolean() }).strict(),
+  },
   session_cleanup: { input: z.object({ id: z.string() }), output: sessionSchema },
   session_repository_status: {
     input: z.object({ sessionId: z.string(), projectId: z.string() }),
@@ -84,6 +89,11 @@ export const rpcContract = defineRpcContract({
 
 const WORKSPACES_CHANGED = "workspaces-changed";
 const SESSION_RECONCILIATION_ERROR_MAX_CHARS = 500;
+
+function deriveSessionName(prompt: string): string {
+  const firstLine = prompt.split(/\r?\n/).find((line) => line.trim()) ?? prompt;
+  return firstLine.trim().replace(/\s+/g, " ").slice(0, 80);
+}
 
 export default async function plugin(bb: BbPluginApi) {
   const database = bb.storage.database();
@@ -263,7 +273,7 @@ export default async function plugin(bb: BbPluginApi) {
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
-    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, requestKey }) => {
+    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey }) => {
       const existing = store.getSessionByRequestKey(requestKey);
       if (existing) return existing;
       const workspace = store.get(workspaceId);
@@ -289,7 +299,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (selected.some((repository) => repository.projectId === workspaceOwnerProjectId)) {
         throw new Error("The synthetic Workspaces project cannot be selected as a repository");
       }
-      let session = store.createSessionSnapshot(workspaceId, expectedRevision, selected, requestKey);
+      const sessionName = name ?? deriveSessionName(prompt);
+      let session = store.createSessionSnapshot(workspaceId, expectedRevision, selected, requestKey, sessionName);
       session = store.updateSession(session.id, { state: "preparing", hostId, ownerProjectId: workspaceOwnerProjectId, error: null });
       changed();
       try {
@@ -307,13 +318,27 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.spawn({
           projectId: workspaceOwnerProjectId,
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: prepared.rootPath } },
-          prompt, title: `🧵 ${workspace.name} · ${prompt.slice(0, 72)}`, visibility: "visible",
+          prompt, title: `${workspace.name} · ${sessionName}`, visibility: "visible",
         });
         session = store.updateSession(session.id, { state: "active", threadId: thread.id }); changed(); return session;
       } catch (error) {
         store.updateSession(session.id, { state: "failed", error: error instanceof Error ? error.message : String(error) });
         changed(); throw error;
       }
+    },
+    session_rename: async ({ id, name }) => {
+      const session = store.renameSession(id, name);
+      let threadTitleUpdated = false;
+      if (session.threadId) {
+        try {
+          await bb.sdk.threads.update({ threadId: session.threadId, title: `${session.workspaceName} · ${session.name}` });
+          threadTitleUpdated = true;
+        } catch (cause) {
+          bb.log.warn(`Workspaces renamed a session locally but could not update its thread title: ${cause instanceof Error ? cause.message : String(cause)}`);
+        }
+      }
+      changed();
+      return { session, threadTitleUpdated };
     },
     session_archive: async ({ id }) => {
       const current = store.getSession(id);
@@ -372,7 +397,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (args[0] === "show" && args.length === 2) { const workspace = store.get(args[1]!); return output(workspace, `${workspace.name}\n${workspace.repositories.map((repository) => `  ${repository.alias}: ${repository.projectId}`).join("\n")}`); }
       if (args[0] === "sessions") {
         const rows = sessionsWithReconciliationErrors(await reconcileActiveSessionsForListing());
-        return output(rows, rows.length ? rows.map((session) => `${session.id}  ${session.state}  ${session.workspaceName}${session.error ? `  ERROR: ${session.error}` : ""}`).join("\n") : "No sessions.");
+        return output(rows, rows.length ? rows.map((session) => `${session.id}  ${session.state}  ${session.workspaceName} · ${session.name ?? "Unnamed session"}${session.error ? `  ERROR: ${session.error}` : ""}`).join("\n") : "No sessions.");
       }
       return { exitCode: args[0] === undefined || args[0] === "help" || args[0] === "--help" ? 0 : 1, stdout: usage };
     },

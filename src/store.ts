@@ -32,6 +32,7 @@ type RepoRow = { project_id: string; alias: string; ordinal: number };
 
 type SessionRow = {
   id: string;
+  name: string | null;
   workspace_id: string | null;
   workspace_name: string;
   workspace_revision: number;
@@ -153,6 +154,8 @@ export const WORKSPACE_MIGRATIONS = [`
   WHERE outcome = 'provisioned';
 `, `
   ALTER TABLE session_expansions ADD COLUMN phase TEXT;
+`, `
+  ALTER TABLE sessions ADD COLUMN name TEXT;
 `];
 
 const WORKSPACE_PROJECT_ID_METADATA_KEY = "workspace-project-id";
@@ -216,7 +219,7 @@ export class WorkspaceStore {
     if (result.changes !== 1) throw new Error("Workspace revision is stale or the workspace no longer exists");
   }
 
-  createSessionSnapshot(workspaceId: string, expectedRevision: number, repositories: RepositoryDraft[], requestKey: string = randomUUID()): SessionSnapshot {
+  createSessionSnapshot(workspaceId: string, expectedRevision: number, repositories: RepositoryDraft[], requestKey: string = randomUUID(), name: string | null = null): SessionSnapshot {
     const existing = this.getSessionByRequestKey(requestKey);
     if (existing) return existing;
     const workspace = this.get(workspaceId);
@@ -236,10 +239,10 @@ export class WorkspaceStore {
       const id = `session_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       const repositoriesJson = JSON.stringify(selected);
       this.db.prepare(`INSERT INTO sessions
-        (id, workspace_id, workspace_name, workspace_revision, instructions, repositories_json, initial_repositories_json,
+        (id, name, workspace_id, workspace_name, workspace_revision, instructions, repositories_json, initial_repositories_json,
          state, request_key, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`)
-        .run(id, workspace.id, workspace.name, workspace.revision, workspace.instructions, repositoriesJson, repositoriesJson, requestKey, now, now);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`)
+        .run(id, name, workspace.id, workspace.name, workspace.revision, workspace.instructions, repositoriesJson, repositoriesJson, requestKey, now, now);
       return id;
     })();
     return this.getSession(id);
@@ -288,6 +291,15 @@ export class WorkspaceStore {
       ? this.db.prepare("SELECT * FROM sessions WHERE workspace_id = ? ORDER BY created_at DESC").all(workspaceId)
       : this.db.prepare("SELECT * FROM sessions ORDER BY created_at DESC").all()) as SessionRow[];
     return rows.map((row) => this.hydrateSession(row));
+  }
+
+  renameSession(id: string, name: string): SessionSnapshot {
+    const normalized = name.trim().replace(/\s+/g, " ");
+    if (!normalized || normalized.length > 80) throw new Error("Session name must be between 1 and 80 characters");
+    const result = this.db.prepare("UPDATE sessions SET name = ?, updated_at = ? WHERE id = ?")
+      .run(normalized, Date.now(), id);
+    if (result.changes !== 1) throw new Error(`Session ${id} was not found`);
+    return this.getSession(id);
   }
 
   updateSession(
@@ -482,6 +494,7 @@ export class WorkspaceStore {
     const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
     return {
       id: row.id,
+      name: row.name ?? null,
       workspaceId: row.workspace_id,
       workspaceName: row.workspace_name,
       workspaceRevision: row.workspace_revision,

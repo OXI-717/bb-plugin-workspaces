@@ -24,7 +24,7 @@ const workspace = {
   instructions: "",
   revision: 1,
   pinned: false,
-  archivedAt: null,
+  archivedAt: null as number | null,
   createdAt: 1,
   updatedAt: 1,
   repositories: [
@@ -35,6 +35,7 @@ const workspace = {
 
 const activeSession = {
   id: "session_auth",
+  name: "Rotate signing keys",
   workspaceId: "ws_auth",
   workspaceName: "Authentication",
   workspaceRevision: 1,
@@ -251,6 +252,77 @@ describe("Workspaces page", () => {
     expect((await reopened.findByRole("checkbox", { name: "Use identity-service" })).getAttribute("data-state")).toBe("checked");
     expect(reopened.getByRole("checkbox", { name: "Use api-gateway" }).getAttribute("data-state")).toBe("unchecked");
     reopened.lifecycle.unmount();
+  });
+
+  it("searches, filters, and progressively reveals a large workspace collection", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const workspaces = Array.from({ length: 120 }, (_, index) => ({
+      ...workspace,
+      id: `ws_${index}`,
+      name: `Workspace ${String(index).padStart(3, "0")}`,
+      description: index === 77 ? "Payments platform" : "",
+      pinned: index === 119,
+      repositories: [{ projectId: "proj_auth", alias: index === 88 ? "rare-repository" : `repo-${index}`, ordinal: 0 }],
+    }));
+    workspaces.push({ ...workspace, id: "ws_archived", name: "Retired workspace", archivedAt: 99 });
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces, sessions: [], projects: [project, gatewayProject] }),
+    } });
+
+    expect(await slot.findByRole("searchbox", { name: "Search workspaces" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Active 120" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Pinned 1" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Archived 1" })).toBeTruthy();
+    expect(slot.getAllByTestId("workspace-navigation-item")).toHaveLength(50);
+    expect(slot.getAllByTestId("workspace-navigation-item")[0]?.textContent).toContain("Workspace 119");
+    fireEvent.click(slot.getByRole("button", { name: "Show 50 more workspaces" }));
+    expect(slot.getAllByTestId("workspace-navigation-item")).toHaveLength(100);
+
+    fireEvent.change(slot.getByRole("searchbox", { name: "Search workspaces" }), { target: { value: "rare-repository" } });
+    expect(slot.getAllByTestId("workspace-navigation-item")).toHaveLength(1);
+    expect(slot.getByText("Workspace 088")).toBeTruthy();
+    expect(slot.getByRole("heading", { name: "Workspace 000" })).toBeTruthy();
+    fireEvent.change(slot.getByRole("searchbox", { name: "Search workspaces" }), { target: { value: "" } });
+    fireEvent.click(slot.getByRole("button", { name: "Archived 1" }));
+    fireEvent.click(slot.getByText("Retired workspace"));
+    expect(slot.getByRole("button", { name: "Restore" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("starts and renames a session with a meaningful name", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const launches: unknown[] = [];
+    const renames: unknown[] = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+      session_start: (input: unknown) => { launches.push(input); return activeSession; },
+      session_rename: (input: unknown) => { renames.push(input); return { session: { ...activeSession, name: "Gateway verification" }, threadTitleUpdated: true }; },
+    } });
+
+    expect(await slot.findByText("Rotate signing keys")).toBeTruthy();
+    fireEvent.change(slot.getByLabelText("Session name"), { target: { value: "Auth rollout" } });
+    fireEvent.change(slot.getByLabelText("Task prompt"), { target: { value: "Deploy the contract" } });
+    fireEvent.click(slot.getByRole("button", { name: "Start thread" }));
+    await expect.poll(() => launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({ name: "Auth rollout", prompt: "Deploy the contract" });
+
+    fireEvent.click(slot.getByRole("button", { name: "Rename session" }));
+    fireEvent.change(slot.getByLabelText("Rename session"), { target: { value: "Gateway verification" } });
+    fireEvent.click(slot.getByRole("button", { name: "Save session name" }));
+    await expect.poll(() => renames).toEqual([{ id: "session_auth", name: "Gateway verification" }]);
+    slot.lifecycle.unmount();
+  });
+
+  it("gives migrated unnamed sessions a dated fallback label", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [{ ...activeSession, name: null }], projects: [project, gatewayProject] }),
+    } });
+
+    expect(await slot.findByText(/^Session · /)).toBeTruthy();
+    expect(slot.getByText(/active · .* · 1 repository/)).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Rename session" })).toBeTruthy();
+    slot.lifecycle.unmount();
   });
 });
 

@@ -157,6 +157,7 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
   const navigate = useBbNavigate();
   const memberProjects = workspace.repositories.map((member) => projects.find((project) => project.id === member.projectId)).filter((project): project is Project => Boolean(project));
   const [selected, setSelected] = useState(() => rememberedSelection(workspace.id, memberProjects.map((project) => project.id)));
+  const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [pending, setPending] = useState(false);
   const [requestKey, setRequestKey] = useState(() => `launch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -176,7 +177,11 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     if (!prompt.trim() || !eligibleHosts.includes(hostId) || pending) return;
     setPending(true); onError("");
     try {
-      const session = await rpc.call("session_start", { workspaceId: workspace.id, expectedRevision: workspace.revision, hostId, projectIds: [...selected], prompt: prompt.trim(), requestKey });
+      const session = await rpc.call("session_start", {
+        workspaceId: workspace.id, expectedRevision: workspace.revision, hostId,
+        projectIds: [...selected], prompt: prompt.trim(), requestKey,
+        ...(name.trim() ? { name: name.trim() } : {}),
+      });
       if (session.threadId) { setRequestKey(`launch-${Date.now()}-${Math.random().toString(36).slice(2)}`); navigate.toThread(session.threadId); }
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setPending(false); }
@@ -186,6 +191,7 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     <div className="flex flex-wrap gap-2">{memberProjects.map((project) => <label key={project.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-sm"><Checkbox checked={selected.has(project.id)} onCheckedChange={(checked) => setSelected((current) => { const next = new Set(current); checked === true ? next.add(project.id) : next.delete(project.id); return next; })} aria-label={`Use ${project.name}`} />{project.name}</label>)}</div>
     {eligibleHosts.length > 1 ? <label className="block text-sm">Host<select className={`${fieldClass} mt-1`} value={hostId} onChange={(event) => setHostId(event.target.value)}>{eligibleHosts.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></label> : null}
     {eligibleHosts.length === 0 && selected.size > 0 ? <p className="text-sm text-destructive">The selected repositories do not share a configured host.</p> : null}
+    <div><label className="mb-1 block text-sm font-medium" htmlFor={`session-name-${workspace.id}`}>Session name <span className="font-normal text-muted-foreground">(optional)</span></label><Input id={`session-name-${workspace.id}`} aria-label="Session name" maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="Derived from the first line of the prompt" /></div>
     <textarea aria-label="Task prompt" className={`${fieldClass} min-h-28 resize-y`} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the outcome across these repositories…" />
     <Button type="submit" disabled={pending || !prompt.trim() || selected.size === 0 || !eligibleHosts.includes(hostId)}><Icon name="Play" className="size-4" />{pending ? "Preparing worktrees…" : "Start thread"}</Button>
   </form>;
@@ -199,6 +205,9 @@ function SessionRow({ session, rpc, onChanged, onError }: {
 }) {
   const navigate = useBbNavigate();
   const [pending, setPending] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState(session.name ?? "");
+  useEffect(() => { setName(session.name ?? ""); }, [session.name]);
   const archive = async () => {
     setPending(true);
     try { await rpc.call("session_archive", { id: session.id }); onChanged(); }
@@ -212,10 +221,23 @@ function SessionRow({ session, rpc, onChanged, onError }: {
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setPending(false); }
   };
-  return <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
-    <div className="min-w-0"><span className="text-sm font-medium">{session.state}</span><span className="ml-2 text-xs text-muted-foreground">{session.repositories.map((repo) => repo.alias).join(", ")}</span>{session.error ? <p className="text-xs text-destructive">{session.error}</p> : null}</div>
-    <div className="flex shrink-0 gap-2">
+  const saveName = async () => {
+    if (!name.trim() || pending) return;
+    setPending(true); onError("");
+    try {
+      const result = await rpc.call("session_rename", { id: session.id, name: name.trim() });
+      setName(result.session.name ?? ""); setRenaming(false); onChanged();
+      if (!result.threadTitleUpdated && result.session.threadId) onError("Session renamed, but its BB thread title could not be updated.");
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setPending(false); }
+  };
+  const displayName = session.name ?? `Session · ${new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(session.createdAt))}`;
+  const created = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(session.createdAt));
+  return <div className="flex flex-col items-start justify-between gap-3 rounded-lg border border-border px-3 py-2 sm:flex-row sm:items-center">
+    <div className="min-w-0 flex-1">{renaming ? <div className="flex max-w-md items-center gap-2"><Input aria-label="Rename session" maxLength={80} value={name} onChange={(event) => setName(event.target.value)} autoFocus /><Button size="sm" disabled={pending || !name.trim()} onClick={saveName}>Save session name</Button><Button size="sm" variant="ghost" disabled={pending} onClick={() => { setName(session.name ?? ""); setRenaming(false); }}>Cancel</Button></div> : <><p className="truncate text-sm font-medium">{displayName}</p><p className="mt-0.5 text-xs text-muted-foreground">{session.state} · {created} · {session.repositories.length} {session.repositories.length === 1 ? "repository" : "repositories"}</p><p className="truncate text-xs text-muted-foreground">{session.repositories.map((repo) => repo.alias).join(", ")}</p></>}{session.error ? <p className="text-xs text-destructive">{session.error}</p> : null}</div>
+    <div className="flex shrink-0 flex-wrap gap-2">
       {session.threadId ? <Button variant="outline" size="sm" onClick={() => navigate.toThread(session.threadId!)}>Open thread</Button> : null}
+      {!renaming ? <Button variant="ghost" size="sm" disabled={pending} aria-label="Rename session" onClick={() => setRenaming(true)}>Rename</Button> : null}
       {session.state === "active" || session.state === "failed" ? <Button variant="ghost" size="sm" disabled={pending} onClick={archive}>Archive</Button> : null}
       {session.state === "archived" ? <Button variant="ghost" size="sm" disabled={pending} onClick={cleanup}>{pending ? "Checking…" : "Remove worktrees"}</Button> : null}
     </div>
@@ -265,21 +287,43 @@ function WorkspacesPage() {
   const { rpc, dashboard, error, setError, load } = useDashboard();
   const [editing, setEditing] = useState<Workspace | "new" | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const active = dashboard?.workspaces.filter((workspace) => workspace.archivedAt === null) ?? [];
-  const archived = dashboard?.workspaces.filter((workspace) => workspace.archivedAt !== null) ?? [];
-  const selected = dashboard?.workspaces.find((workspace) => workspace.id === selectedId) ?? active[0];
+  const [workspaceQuery, setWorkspaceQuery] = useState("");
+  const [workspaceFilter, setWorkspaceFilter] = useState<"active" | "pinned" | "archived">("active");
+  const [visibleWorkspaceCount, setVisibleWorkspaceCount] = useState(50);
+  const workspaces = dashboard?.workspaces ?? [];
+  const activeCount = workspaces.filter((workspace) => workspace.archivedAt === null).length;
+  const pinnedCount = workspaces.filter((workspace) => workspace.archivedAt === null && workspace.pinned).length;
+  const archivedCount = workspaces.filter((workspace) => workspace.archivedAt !== null).length;
+  const selected = workspaces.find((workspace) => workspace.id === selectedId)
+    ?? workspaces.find((workspace) => workspace.archivedAt === null)
+    ?? workspaces[0];
+  const filteredWorkspaces = useMemo(() => {
+    const query = workspaceQuery.trim().toLocaleLowerCase();
+    return workspaces
+      .filter((workspace) => workspaceFilter === "archived" ? workspace.archivedAt !== null : workspace.archivedAt === null)
+      .filter((workspace) => workspaceFilter !== "pinned" || workspace.pinned)
+      .filter((workspace) => !query || workspace.name.toLocaleLowerCase().includes(query)
+        || workspace.description.toLocaleLowerCase().includes(query)
+        || workspace.repositories.some((repository) => repository.alias.toLocaleLowerCase().includes(query)))
+      .sort((left, right) => Number(right.pinned) - Number(left.pinned) || left.name.localeCompare(right.name));
+  }, [workspaceFilter, workspaceQuery, workspaces]);
+  useEffect(() => { setVisibleWorkspaceCount(50); }, [workspaceFilter, workspaceQuery]);
+  const visibleWorkspaces = filteredWorkspaces.slice(0, visibleWorkspaceCount);
+  const mutateWorkspace = async (operation: () => Promise<unknown>) => {
+    try { await operation(); load(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  };
   return <div className="h-full min-h-0 flex-1 overflow-y-auto"><div className="mx-auto w-full max-w-5xl space-y-4 px-4 pb-8 pt-4">
     <div className="flex items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Workspaces</h1><p className="text-sm text-muted-foreground">Group related repositories and run one isolated task across the ones you choose.</p></div><Button onClick={() => setEditing("new")}><Icon name="Plus" className="size-4" />New workspace</Button></div>
     {error ? <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p> : null}
     <Dialog open={editing !== null} onOpenChange={(open) => { if (!open) setEditing(null); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:grid-rows-[auto_minmax(0,1fr)] sm:overflow-hidden sm:max-w-2xl">{editing ? <><DialogHeader><DialogTitle>{editing === "new" ? "Create workspace" : "Edit workspace"}</DialogTitle><DialogDescription>Choose the BB projects that should be available together.</DialogDescription></DialogHeader><WorkspaceForm projects={dashboard?.projects ?? []} initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={async (draft) => { try { editing === "new" ? await rpc.call("workspace_create", draft) : await rpc.call("workspace_update", { id: editing.id, expectedRevision: editing.revision, draft }); setEditing(null); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }} /></> : null}</DialogContent></Dialog>
-    {dashboard === null ? <Empty>Loading workspaces…</Empty> : active.length === 0 && !editing ? <Empty>No active workspaces. Create one or restore an archived workspace below.</Empty> : <div className="grid gap-4 md:grid-cols-[minmax(220px,0.7fr)_minmax(0,1.6fr)]">
-      <aside className="space-y-2">{active.map((workspace) => <button key={workspace.id} onClick={() => setSelectedId(workspace.id)} className={`w-full rounded-lg border p-3 text-left ${selected?.id === workspace.id ? "border-foreground bg-muted" : "border-border bg-card hover:bg-muted/60"}`}><span className="block font-medium">{workspace.name}</span><span className="mt-1 block text-xs text-muted-foreground">{workspace.repositories.length} repositories</span></button>)}</aside>
-      {selected ? <main className="space-y-4"><div className="rounded-lg border border-border bg-card p-4"><div className="flex items-start justify-between gap-2"><div><h2 className="text-lg font-semibold">{selected.name}</h2><p className="text-sm text-muted-foreground">{selected.description || "No description"}</p></div><div className="flex gap-1"><Button variant="ghost" size="sm" onClick={() => setEditing(selected)}>Edit</Button><Button variant="ghost" size="sm" onClick={async () => { await rpc.call("workspace_set_pinned", { id: selected.id, expectedRevision: selected.revision, pinned: !selected.pinned }); load(); }}>{selected.pinned ? "Unpin" : "Pin"}</Button><Button variant="ghost" size="sm" onClick={async () => { await rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: true }); setSelectedId(null); load(); }}>Archive</Button></div></div><div className="mt-3 flex flex-wrap gap-2">{selected.repositories.map((repository) => <span key={repository.projectId} className="rounded-full bg-muted px-2.5 py-1 text-xs">{repository.alias}</span>)}</div></div>
-        <SessionLauncher key={selected.id} workspace={selected} projects={dashboard.projects} rpc={rpc} onError={(message) => setError(message || null)} />
+    {dashboard === null ? <Empty>Loading workspaces…</Empty> : workspaces.length === 0 && !editing ? <Empty>No workspaces yet. Create one to group repositories.</Empty> : <div className="grid gap-4 md:grid-cols-[minmax(240px,0.75fr)_minmax(0,1.6fr)]">
+      <aside className="self-start md:sticky md:top-4"><div className="space-y-2 rounded-lg border border-border bg-card p-2"><Input type="search" aria-label="Search workspaces" placeholder="Search workspaces…" value={workspaceQuery} onChange={(event) => setWorkspaceQuery(event.target.value)} /><div className="grid grid-cols-3 gap-1" aria-label="Workspace filters"><Button type="button" size="sm" variant={workspaceFilter === "active" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("active")}>Active {activeCount}</Button><Button type="button" size="sm" variant={workspaceFilter === "pinned" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("pinned")}>Pinned {pinnedCount}</Button><Button type="button" size="sm" variant={workspaceFilter === "archived" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("archived")}>Archived {archivedCount}</Button></div><div className="max-h-[calc(100vh-14rem)] space-y-2 overflow-y-auto pr-1">{visibleWorkspaces.map((workspace) => <button data-testid="workspace-navigation-item" key={workspace.id} onClick={() => setSelectedId(workspace.id)} className={`w-full rounded-lg border p-3 text-left ${selected?.id === workspace.id ? "border-foreground bg-muted" : "border-border bg-card hover:bg-muted/60"}`}><span className="flex items-center justify-between gap-2"><span className="truncate font-medium">{workspace.name}</span>{workspace.pinned ? <Icon name="Pin" className="size-3.5 shrink-0 text-muted-foreground" /> : null}</span><span className="mt-1 block text-xs text-muted-foreground">{workspace.repositories.length} repositories</span></button>)}{visibleWorkspaces.length === 0 ? <div className="px-2 py-6 text-center text-sm text-muted-foreground">{workspaceQuery.trim() ? "No matching workspaces." : `No ${workspaceFilter} workspaces.`}</div> : null}{filteredWorkspaces.length > visibleWorkspaces.length ? <Button type="button" variant="ghost" className="w-full" onClick={() => setVisibleWorkspaceCount((count) => count + 50)}>Show 50 more workspaces</Button> : null}</div></div></aside>
+      {selected ? <main className="space-y-4"><div className="rounded-lg border border-border bg-card p-4"><div className="flex items-start justify-between gap-2"><div><h2 className="text-lg font-semibold">{selected.name}</h2><p className="text-sm text-muted-foreground">{selected.description || "No description"}</p></div><div className="flex gap-1">{selected.archivedAt === null ? <><Button variant="ghost" size="sm" onClick={() => setEditing(selected)}>Edit</Button><Button variant="ghost" size="sm" onClick={() => mutateWorkspace(() => rpc.call("workspace_set_pinned", { id: selected.id, expectedRevision: selected.revision, pinned: !selected.pinned }))}>{selected.pinned ? "Unpin" : "Pin"}</Button><Button variant="ghost" size="sm" onClick={async () => { await mutateWorkspace(() => rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: true })); setSelectedId(null); }}>Archive</Button></> : <><Button variant="outline" size="sm" onClick={() => mutateWorkspace(() => rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: false }))}>Restore</Button><Button variant="ghost" size="sm" onClick={() => { if (globalThis.confirm(`Delete workspace “${selected.name}”? Its session history will remain.`)) void mutateWorkspace(() => rpc.call("workspace_remove", { id: selected.id, expectedRevision: selected.revision })); }}>Delete</Button></>}</div></div><div className="mt-3 flex flex-wrap gap-2">{selected.repositories.map((repository) => <span key={repository.projectId} className="rounded-full bg-muted px-2.5 py-1 text-xs">{repository.alias}</span>)}</div></div>
+        {selected.archivedAt === null ? <SessionLauncher key={selected.id} workspace={selected} projects={dashboard.projects} rpc={rpc} onError={(message) => setError(message || null)} /> : null}
         <section><h3 className="mb-2 text-sm font-semibold">Sessions</h3>{dashboard.sessions.filter((session) => session.workspaceId === selected.id).length === 0 ? <Empty>No workspace sessions yet.</Empty> : <div className="space-y-2">{dashboard.sessions.filter((session) => session.workspaceId === selected.id).map((session) => <SessionRow key={session.id} session={session} rpc={rpc} onChanged={load} onError={(message) => setError(message)} />)}</div>}</section>
       </main> : null}
     </div>}
-    {archived.length > 0 ? <section className="space-y-2"><h2 className="text-sm font-semibold">Archived workspaces</h2>{archived.map((workspace) => <div key={workspace.id} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2"><div><p className="text-sm font-medium">{workspace.name}</p><p className="text-xs text-muted-foreground">{workspace.repositories.length} repositories</p></div><div className="flex gap-2"><Button variant="outline" size="sm" onClick={async () => { try { await rpc.call("workspace_set_archived", { id: workspace.id, expectedRevision: workspace.revision, archived: false }); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }}>Restore</Button><Button variant="ghost" size="sm" onClick={async () => { if (!globalThis.confirm(`Delete workspace “${workspace.name}”? Its session history will remain.`)) return; try { await rpc.call("workspace_remove", { id: workspace.id, expectedRevision: workspace.revision }); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }}>Delete</Button></div></div>)}</section> : null}
   </div></div>;
 }
 
