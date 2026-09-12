@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "../server";
 import { WorkspaceStore } from "../src/store";
-import type { SessionSnapshot } from "../src/contracts";
+import { DEFAULT_BASE_REF, type SessionSnapshot } from "../src/contracts";
 import type { PreparedRepository } from "../src/worktrees";
 
 const projects = [
@@ -98,6 +98,22 @@ async function boundaryFixture(updateThread = true) {
 }
 
 describe("Workspaces plugin server", () => {
+  it("defaults a session to each repository's default branch and honours an explicit base", async () => {
+    const fixture = await boundaryFixture();
+    expect(fixture.session.repositories.map((repository) => repository.baseRef)).toEqual([DEFAULT_BASE_REF]);
+    const added = await fixture.harness.behavior.callRpc("session_add_repository", {
+      threadId: "thr_first", projectId: "proj_gateway", requestKey: "explicit-base-add", baseRef: "release/2026-09",
+    }) as { session: SessionSnapshot };
+    expect(added.session.repositories.find((repository) => repository.alias === "gateway")?.baseRef).toBe("release/2026-09");
+  });
+
+  it("rejects a base ref that could act as a git flag", async () => {
+    const fixture = await boundaryFixture();
+    await expect(fixture.harness.behavior.callRpc("session_add_repository", {
+      threadId: "thr_first", projectId: "proj_gateway", requestKey: "unsafe-base-add", baseRef: "--upload-pack=touch",
+    })).rejects.toThrow();
+  });
+
   it("derives a session name and synchronizes later renames to the BB thread", async () => {
     const fixture = await boundaryFixture();
     expect(fixture.session.name).toBe("Boundary check");
@@ -621,7 +637,7 @@ describe("Workspaces plugin server", () => {
         sessionId,
         operationKey: expect.stringMatching(/^agent-/),
         instructions: "Coordinate the services.",
-        repository: { projectId: "proj_gateway", alias: "gateway", sourcePath: "/repos/gateway", baseRef: "HEAD" },
+        repository: { projectId: "proj_gateway", alias: "gateway", sourcePath: "/repos/gateway", baseRef: DEFAULT_BASE_REF },
       },
     });
 
@@ -641,7 +657,7 @@ describe("Workspaces plugin server", () => {
         sessionId,
         operationKey: "manual-billing-1",
         instructions: "Coordinate the services.",
-        repository: { projectId: "proj_billing", alias: "billing", sourcePath: "/repos/billing", baseRef: "HEAD" },
+        repository: { projectId: "proj_billing", alias: "billing", sourcePath: "/repos/billing", baseRef: DEFAULT_BASE_REF },
       },
     });
   });

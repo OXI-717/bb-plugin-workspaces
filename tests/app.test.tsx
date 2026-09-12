@@ -291,6 +291,30 @@ describe("Workspaces page", () => {
     slot.lifecycle.unmount();
   });
 
+  it("defaults every repository to its default branch and sends a chosen override", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const launches: Array<{ bases: Record<string, string> }> = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+      repository_bases: () => ({ repositories: [
+        { projectId: "proj_auth", defaultBase: "origin/master", currentBranch: "feature/work", currentCommit: "a".repeat(40), refs: ["origin/master", "feature/work", "origin/release"], fetchError: null },
+        { projectId: "proj_gateway", defaultBase: "origin/main", currentBranch: "main", currentCommit: "b".repeat(40), refs: ["origin/main"], fetchError: null },
+      ] }),
+      session_start: (input: unknown) => { launches.push(input as { bases: Record<string, string> }); return activeSession; },
+    } });
+
+    expect(await slot.findByText("Branching from each repository's default branch, freshly fetched.")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Change base" }));
+    fireEvent.change(await slot.findByLabelText("Base for identity-service"), { target: { value: "feature/work" } });
+    expect(slot.getByText("Using a custom base for at least one repository.")).toBeTruthy();
+
+    fireEvent.change(slot.getByLabelText("Task prompt"), { target: { value: "Deploy the contract" } });
+    fireEvent.click(slot.getByRole("button", { name: "Start thread" }));
+    await expect.poll(() => launches).toHaveLength(1);
+    expect(launches[0]!.bases).toEqual({ proj_auth: "feature/work", proj_gateway: "@default" });
+    slot.lifecycle.unmount();
+  });
+
   it("starts and renames a session with a meaningful name", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const launches: unknown[] = [];

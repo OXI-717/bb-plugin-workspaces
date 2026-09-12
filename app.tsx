@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc, type PluginPendingInteractionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, uniqueAlias, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
+import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, uniqueAlias, DEFAULT_BASE_REF, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -16,6 +16,35 @@ type Project = {
 };
 type Dashboard = { workspaces: Workspace[]; sessions: SessionSnapshot[]; projects: Project[] };
 type ExpansionOption = { projectId: string; alias: string; projectName: string; sourcePath: string; member: boolean };
+type RepositoryBases = { projectId: string; defaultBase: string; currentBranch: string | null; currentCommit: string; refs: string[]; fetchError: string | null };
+
+function baseOptions(bases: RepositoryBases): Array<{ value: string; label: string }> {
+  const current = bases.currentBranch ?? bases.currentCommit.slice(0, 12);
+  const listed = [
+    { value: DEFAULT_BASE_REF, label: `Default branch — ${bases.defaultBase}` },
+    { value: bases.currentBranch ?? bases.currentCommit, label: `Current checkout — ${current}` },
+  ];
+  const claimed = new Set([bases.defaultBase, listed[1]!.value]);
+  return [...listed, ...bases.refs.filter((ref) => !claimed.has(ref)).map((ref) => ({ value: ref, label: ref }))];
+}
+
+/** Loads each repository's candidate bases, fetching remotes so the default branch is current. */
+function useRepositoryBases(rpc: ReturnType<typeof useRpc<typeof rpcContract>>, hostId: string, projectIds: string[]) {
+  const [bases, setBases] = useState<Record<string, RepositoryBases> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const key = `${hostId}:${[...projectIds].sort().join(",")}`;
+  const latest = useRef("");
+  useEffect(() => {
+    if (!hostId || projectIds.length === 0) { setBases(null); return; }
+    latest.current = key; setBases(null); setError(null);
+    rpc.call("repository_bases", { hostId, projectIds, fetch: true }).then(
+      (result) => { if (latest.current !== key) return; setBases(Object.fromEntries(result.repositories.map((row) => [row.projectId, row]))); },
+      (cause) => { if (latest.current !== key) return; setError(cause instanceof Error ? cause.message : String(cause)); },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, rpc]);
+  return { bases, error };
+}
 
 const fieldClass = "w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring";
 
@@ -164,14 +193,22 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     catch { /* Keep the in-memory selection when storage is unavailable. */ }
   }, [selected, workspace.id]);
   useEffect(() => { if (!eligibleHosts.includes(hostId)) setHostId(eligibleHosts[0] ?? ""); }, [eligibleHosts, hostId]);
+  const selectedIds = useMemo(() => memberProjects.filter((project) => selected.has(project.id)).map((project) => project.id), [memberProjects, selected]);
+  const { bases, error: basesError } = useRepositoryBases(rpc, hostId, selectedIds);
+  const [chosenBases, setChosenBases] = useState<Record<string, string>>({});
+  const [showBases, setShowBases] = useState(false);
+  useEffect(() => { setChosenBases({}); }, [bases]);
+  const baseFor = (projectId: string) => chosenBases[projectId] ?? DEFAULT_BASE_REF;
+  const allDefault = selectedIds.every((projectId) => baseFor(projectId) === DEFAULT_BASE_REF);
   const start = async (event: FormEvent) => {
     event.preventDefault();
     if (!prompt.trim() || !eligibleHosts.includes(hostId) || pending) return;
     setPending(true); onError("");
     try {
+      const overrides = Object.fromEntries(selectedIds.map((projectId) => [projectId, baseFor(projectId)]));
       const session = await rpc.call("session_start", {
         workspaceId: workspace.id, expectedRevision: workspace.revision, hostId,
-        projectIds: [...selected], prompt: prompt.trim(), requestKey,
+        projectIds: [...selected], prompt: prompt.trim(), requestKey, bases: overrides,
         ...(name.trim() ? { name: name.trim() } : {}),
       });
       if (session.threadId) { setRequestKey(`launch-${Date.now()}-${Math.random().toString(36).slice(2)}`); navigate.toThread(session.threadId); }
@@ -183,6 +220,25 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     <div className="flex flex-wrap gap-2">{memberProjects.map((project) => <label key={project.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-sm"><Checkbox checked={selected.has(project.id)} onCheckedChange={(checked) => setSelected((current) => { const next = new Set(current); checked === true ? next.add(project.id) : next.delete(project.id); return next; })} aria-label={`Use ${project.name}`} />{project.name}</label>)}</div>
     {eligibleHosts.length > 1 ? <label className="block text-sm">Host<select className={`${fieldClass} mt-1`} value={hostId} onChange={(event) => setHostId(event.target.value)}>{eligibleHosts.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></label> : null}
     {eligibleHosts.length === 0 && selected.size > 0 ? <p className="text-sm text-destructive">The selected repositories do not share a configured host.</p> : null}
+    {selectedIds.length > 0 ? <div className="rounded-md border border-border p-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">{bases ? (allDefault ? "Branching from each repository's default branch, freshly fetched." : "Using a custom base for at least one repository.") : basesError ? "Could not read repository branches." : "Reading repository branches…"}</p>
+        <Button type="button" variant="ghost" size="sm" disabled={!bases} onClick={() => setShowBases((current) => !current)}>{showBases ? "Hide bases" : "Change base"}</Button>
+      </div>
+      {basesError ? <p className="mt-1 text-xs text-destructive">{basesError}</p> : null}
+      {showBases && bases ? <div className="mt-2 space-y-2">{selectedIds.map((projectId) => {
+        const row = bases[projectId];
+        const project = memberProjects.find((candidate) => candidate.id === projectId);
+        if (!row || !project) return null;
+        return <div key={projectId} className="flex flex-wrap items-center gap-2">
+          <label className="min-w-40 text-sm" htmlFor={`base-${projectId}`}>{project.name}</label>
+          <select id={`base-${projectId}`} aria-label={`Base for ${project.name}`} className={`${fieldClass} max-w-xs`} value={baseFor(projectId)} onChange={(event) => setChosenBases((current) => ({ ...current, [projectId]: event.target.value }))}>
+            {baseOptions(row).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          {row.fetchError ? <span className="text-xs text-destructive">Fetch failed; using the last fetched commit.</span> : null}
+        </div>;
+      })}</div> : null}
+    </div> : null}
     <div><label className="mb-1 block text-sm font-medium" htmlFor={`session-name-${workspace.id}`}>Session name <span className="font-normal text-muted-foreground">(optional)</span></label><Input id={`session-name-${workspace.id}`} aria-label="Session name" maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="Derived from the first line of the prompt" /></div>
     <textarea aria-label="Task prompt" className={`${fieldClass} min-h-28 resize-y`} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the outcome across these repositories…" />
     <Button type="submit" disabled={pending || !prompt.trim() || selected.size === 0 || !eligibleHosts.includes(hostId)}><Icon name="Play" className="size-4" />{pending ? "Preparing worktrees…" : "Start thread"}</Button>
@@ -329,6 +385,9 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [adding, setAdding] = useState(false);
+  const [baseRef, setBaseRef] = useState(DEFAULT_BASE_REF);
+  const baseRefRef = useRef(DEFAULT_BASE_REF);
+  const { bases: addBases } = useRepositoryBases(rpc, showAddForm ? session?.hostId ?? "" : "", showAddForm && selectedProjectId ? [selectedProjectId] : []);
   const requestKey = useRef<string | null>(null);
   const submittedOption = useRef<ExpansionOption | null>(null);
   const generation = useRef(0);
@@ -344,6 +403,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
     addFormOpen.current = false; selectedProjectIdRef.current = "";
     if (clearRequestKey) { requestKey.current = null; submittedOption.current = null; }
     setShowAddForm(false); setSelectedProjectId("");
+    baseRefRef.current = DEFAULT_BASE_REF; setBaseRef(DEFAULT_BASE_REF);
   }, []);
   useEffect(() => {
     generation.current += 1; currentThreadId.current = threadId;
@@ -379,6 +439,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   };
   const openAddForm = () => {
     if (session?.state !== "active" || latestOptionsSessionState.current !== "active" || !options?.length) return;
+    baseRefRef.current = DEFAULT_BASE_REF; setBaseRef(DEFAULT_BASE_REF);
     if (requestKey.current === null) requestKey.current = makeRequestKey();
     const projectId = options[0]!.projectId;
     if (submittedOption.current && submittedOption.current.projectId !== projectId) { requestKey.current = makeRequestKey(); submittedOption.current = null; }
@@ -395,7 +456,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
     addPending.current = true;
     setAdding(true); setOptionsError(null);
     try {
-      const result = await rpc.call("session_add_repository", { threadId, projectId: option.projectId, requestKey: key });
+      const result = await rpc.call("session_add_repository", { threadId, projectId: option.projectId, requestKey: key, baseRef: baseRefRef.current });
       if (generation.current !== requestGeneration || currentThreadId.current !== threadId) return;
       if (result.outcome !== "provisioned" && result.outcome !== "superseded") {
         setOptionsError(result.error ?? (result.outcome === "pending" ? "Repository addition is pending recovery. Retry this request." : result.outcome === "cancelled" ? "Repository request was cancelled." : "Repository addition failed."));
@@ -415,8 +476,9 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   if (!dashboard) return <p className="text-sm text-muted-foreground">Loading repositories…</p>;
   if (!session) return <Empty>This thread was not launched from a multi-repository workspace session.</Empty>;
   if (session.state === "cleaned") return <Empty>This session's worktrees were removed. Its repository branches are still available.</Empty>;
+  const changeBase = (ref: string) => { baseRefRef.current = ref; setBaseRef(ref); };
   const changeTarget = (projectId: string) => {
-    if (selectedProjectIdRef.current !== projectId) { requestKey.current = makeRequestKey(); submittedOption.current = null; }
+    if (selectedProjectIdRef.current !== projectId) { requestKey.current = makeRequestKey(); submittedOption.current = null; changeBase(DEFAULT_BASE_REF); }
     selectedProjectIdRef.current = projectId;
     setSelectedProjectId(projectId);
   };
@@ -426,7 +488,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const memberOptions = displayedOptions?.filter((option) => option.member) ?? [];
   const otherOptions = displayedOptions?.filter((option) => !option.member) ?? [];
   const pendingOption = displayedOptions?.find((option) => option.projectId === selectedProjectId);
-  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">Every project on this session’s host is already checked out here.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{memberOptions.length ? <optgroup label="In this workspace">{memberOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}{otherOptions.length ? <optgroup label="Other projects">{otherOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}</select></label><Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button>{pendingOption && !pendingOption.member ? <p className="w-full text-xs text-muted-foreground">{pendingOption.projectName} also joins workspace “{session.workspaceName}” as {pendingOption.alias}.</p> : null}</form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p></div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
+  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">Every project on this session’s host is already checked out here.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{memberOptions.length ? <optgroup label="In this workspace">{memberOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}{otherOptions.length ? <optgroup label="Other projects">{otherOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}</select></label>{addBases?.[selectedProjectId] ? <label className="text-sm" htmlFor="repository-base">Branch from<select id="repository-base" className={`${fieldClass} mt-1`} value={baseRef} onChange={(event) => changeBase(event.target.value)} disabled={adding}>{baseOptions(addBases[selectedProjectId]!).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}<Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button>{pendingOption && !pendingOption.member ? <p className="w-full text-xs text-muted-foreground">{pendingOption.projectName} also joins workspace “{session.workspaceName}” as {pendingOption.alias}.</p> : null}</form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p>{repository.baseRef ? <p className="text-xs text-muted-foreground">from {repository.baseRef}{repository.baseCommit ? ` · ${repository.baseCommit.slice(0, 8)}` : ""}</p> : null}</div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
 }
 
 export default definePluginApp((app) => {

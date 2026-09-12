@@ -5,6 +5,7 @@ import {
   cleanupSession,
   ensureAnchor,
   prepareSession,
+  readRepositoryBases,
   readRepositoryStatus,
   readSessionManifest,
 } from "./src/worktrees";
@@ -28,5 +29,6 @@ export default experimental_defineHostEntry({
     },
     repository_status: ({ worktreePath, baseCommit }) =>
       readRepositoryStatus(worktreePath, baseCommit),
+    repository_bases: async (input) => ({ repositories: await readRepositoryBases(input) }),
   },
 });

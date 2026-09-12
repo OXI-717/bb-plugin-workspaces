@@ -1,6 +1,6 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { MAX_SESSION_REPOSITORIES } from "./contracts";
+import { baseRefSchema, MAX_BASE_REFS, MAX_SESSION_REPOSITORIES } from "./contracts";
 
 export const preparedRepositorySchema = z.object({
   projectId: z.string(),
@@ -39,7 +39,7 @@ export const hostContract = defineRpcContract({
         projectId: z.string(),
         alias: z.string(),
         sourcePath: z.string(),
-        baseRef: z.string(),
+        baseRef: baseRefSchema,
       })).min(1).max(20),
     }),
     output: z.object({
@@ -64,7 +64,7 @@ export const hostContract = defineRpcContract({
         projectId: z.string().min(1),
         alias: z.string().regex(/^[a-z][a-z0-9-]{0,47}$/),
         sourcePath: z.string().min(1),
-        baseRef: z.string().min(1),
+        baseRef: baseRefSchema,
       }).strict(),
     }).strict(),
     output: z.object({
@@ -78,6 +78,22 @@ export const hostContract = defineRpcContract({
       repositories: z.array(preparedRepositorySchema).min(1).max(MAX_SESSION_REPOSITORIES),
     }),
     output: z.object({ cleaned: z.literal(true) }),
+  },
+  repository_bases: {
+    input: z.object({
+      repositories: z.array(z.object({ projectId: z.string().min(1), sourcePath: z.string().min(1) })).min(1).max(MAX_SESSION_REPOSITORIES),
+      fetch: z.boolean(),
+    }).strict(),
+    output: z.object({
+      repositories: z.array(z.object({
+        projectId: z.string(),
+        defaultBase: z.string(),
+        currentBranch: z.string().nullable(),
+        currentCommit: z.string(),
+        refs: z.array(z.string()).max(MAX_BASE_REFS),
+        fetchError: z.string().nullable(),
+      }).strict()),
+    }).strict(),
   },
   repository_status: {
     input: z.object({ worktreePath: z.string(), baseCommit: z.string() }),

@@ -4,7 +4,7 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { MAX_SESSION_REPOSITORIES } from "./contracts";
+import { baseRefSchema, DEFAULT_BASE_REF, MAX_BASE_REFS, MAX_SESSION_REPOSITORIES } from "./contracts";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,12 +55,91 @@ export type RepositoryStatus = {
   changedFiles: ChangedFile[];
 };
 
-async function git(cwd: string, args: string[]): Promise<string> {
+const FETCH_TIMEOUT_MS = 20_000;
+
+async function git(cwd: string, args: string[], timeoutMs?: number): Promise<string> {
   const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
   });
   return stdout.trim();
+}
+
+export type RepositoryBases = {
+  projectId: string;
+  defaultBase: string;
+  currentBranch: string | null;
+  currentCommit: string;
+  refs: string[];
+  fetchError: string | null;
+};
+
+async function refExists(sourcePath: string, ref: string): Promise<boolean> {
+  try { await git(sourcePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]); return true; }
+  catch { return false; }
+}
+
+async function listRemotes(sourcePath: string): Promise<string[]> {
+  try { return (await git(sourcePath, ["remote"])).split("\n").filter(Boolean); }
+  catch { return []; }
+}
+
+/** Refreshes remote-tracking refs. It never touches the checkout, so the user's own branch is unaffected. */
+async function fetchRemote(sourcePath: string, remote: string): Promise<string | null> {
+  try { await git(sourcePath, ["fetch", "--prune", "--quiet", remote], FETCH_TIMEOUT_MS); return null; }
+  catch (cause) { return (cause instanceof Error ? cause.message : String(cause)).split("\n")[0] ?? "git fetch failed"; }
+}
+
+async function defaultBaseRef(sourcePath: string): Promise<string> {
+  try { return await git(sourcePath, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]); } catch { /* origin/HEAD is optional. */ }
+  for (const candidate of ["origin/master", "origin/main", "master", "main"]) {
+    if (await refExists(sourcePath, candidate)) return candidate;
+  }
+  return "HEAD";
+}
+
+function remoteOwning(ref: string, remotes: string[]): string | null {
+  return remotes.find((remote) => ref.startsWith(`${remote}/`)) ?? null;
+}
+
+/** Resolves a requested base to a concrete commit, fetching first when the base tracks a remote. */
+async function resolveBase(sourcePath: string, requested: string): Promise<{ baseRef: string; baseCommit: string }> {
+  baseRefSchema.parse(requested);
+  const baseRef = requested === DEFAULT_BASE_REF ? await defaultBaseRef(sourcePath) : requested;
+  const remote = remoteOwning(baseRef, await listRemotes(sourcePath));
+  if (remote) await fetchRemote(sourcePath, remote);
+  return { baseRef, baseCommit: await git(sourcePath, ["rev-parse", "--verify", `${baseRef}^{commit}`]) };
+}
+
+export async function readRepositoryBases(input: {
+  repositories: Array<{ projectId: string; sourcePath: string }>;
+  fetch: boolean;
+}): Promise<RepositoryBases[]> {
+  return Promise.all(input.repositories.map(async (repository) => {
+    const sourcePath = resolve(repository.sourcePath);
+    const fetchErrors: string[] = [];
+    if (input.fetch) {
+      for (const remote of await listRemotes(sourcePath)) {
+        const failure = await fetchRemote(sourcePath, remote);
+        if (failure) fetchErrors.push(failure);
+      }
+    }
+    const listed = await git(sourcePath, [
+      "for-each-ref", "--sort=-committerdate", `--count=${MAX_BASE_REFS}`, "--format=%(refname:short)", "refs/remotes", "refs/heads",
+    ]);
+    let currentBranch: string | null = null;
+    try { currentBranch = await git(sourcePath, ["symbolic-ref", "--short", "HEAD"]); } catch { /* A detached HEAD has no branch. */ }
+    return {
+      projectId: repository.projectId,
+      defaultBase: await defaultBaseRef(sourcePath),
+      currentBranch,
+      currentCommit: await git(sourcePath, ["rev-parse", "HEAD"]),
+      refs: listed.split("\n").filter((ref) => ref && !ref.endsWith("/HEAD")),
+      fetchError: fetchErrors[0] ?? null,
+    };
+  }));
 }
 
 function sessionSlug(sessionId: string): string {
@@ -295,11 +374,11 @@ export async function prepareSession(input: {
   try {
     for (const repository of input.repositories) {
       const sourcePath = resolve(repository.sourcePath);
-      const baseCommit = await git(sourcePath, ["rev-parse", "--verify", `${repository.baseRef}^{commit}`]);
+      const base = await resolveBase(sourcePath, repository.baseRef);
       const worktreePath = join(reposRoot, repository.alias);
       const branch = `bb-workspace/${sessionSlug(input.sessionId)}/${repository.alias}`;
-      await git(sourcePath, ["worktree", "add", "-b", branch, worktreePath, baseCommit]);
-      prepared.push({ ...repository, sourcePath, baseCommit, branch, worktreePath });
+      await git(sourcePath, ["worktree", "add", "-b", branch, worktreePath, base.baseCommit]);
+      prepared.push({ ...repository, sourcePath, ...base, branch, worktreePath });
     }
     const manifest: SessionManifest = {
       schemaVersion: 2,
@@ -420,17 +499,17 @@ export async function addRepository(input: {
 
     const worktreePath = join(reposRoot, repository.alias);
     const branch = `bb-workspace/${sessionSlug(input.sessionId)}/${repository.alias}`;
-    const baseCommit = await git(repository.sourcePath, ["rev-parse", "--verify", `${repository.baseRef}^{commit}`]);
+    const base = await resolveBase(repository.sourcePath, repository.baseRef);
     if (await pathExists(worktreePath)) throw new Error(`Repository worktree path already exists: ${worktreePath}`);
     if (await branchExists(repository.sourcePath, branch)) throw new Error(`Repository branch already exists: ${branch}`);
-    const prepared: PreparedRepository = { ...repository, baseCommit, branch, worktreePath };
+    const prepared: PreparedRepository = { ...repository, ...base, branch, worktreePath };
     let branchCreated = false;
     let worktreeAttempted = false;
     let agentsReplaced = false;
     const agentsPath = join(rootPath, "AGENTS.md");
     const priorAgents = await readFile(agentsPath, "utf8");
     try {
-      await git(repository.sourcePath, ["branch", branch, baseCommit]);
+      await git(repository.sourcePath, ["branch", branch, base.baseCommit]);
       branchCreated = true;
       worktreeAttempted = true;
       if (input.fileOperations?.addWorktree) {

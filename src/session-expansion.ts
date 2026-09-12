@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { uniqueAlias, MAX_SESSION_REPOSITORIES, MAX_WORKSPACE_REPOSITORIES, EXPANSION_ERROR_MAX_CHARS, expansionApprovalPayloadSchema, expansionApprovalResponseSchema, type ExpansionOutcome, type SessionExpansion, type SessionRepository, type SessionSnapshot } from "./contracts";
+import { uniqueAlias, DEFAULT_BASE_REF, MAX_SESSION_REPOSITORIES, MAX_WORKSPACE_REPOSITORIES, EXPANSION_ERROR_MAX_CHARS, expansionApprovalPayloadSchema, expansionApprovalResponseSchema, type ExpansionOutcome, type SessionExpansion, type SessionRepository, type SessionSnapshot } from "./contracts";
 import type { WorkspaceStore } from "./store";
 
 export type ExpansionProject = { id: string; name: string; sources: Array<{ id: string; hostId: string; path: string; isDefault: boolean }> };
@@ -18,7 +18,7 @@ export type SessionExpansionDeps = {
   reportError?(input: { operation: "workspaces-changed"; sessionId: string; error: string }): void;
 };
 export type AgentExpansionRequest = { threadId: string; alias: string; reason: string; requestKey: string; signal?: AbortSignal };
-export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string; reason?: string };
+export type ManualExpansionRequest = { threadId: string; projectId: string; requestKey: string; reason?: string; baseRef?: string };
 export type ExpansionResult = { added: boolean; outcome: ExpansionOutcome; error: string | null; alias: string; policy: "ask" | "auto"; session: SessionSnapshot; cancelled?: boolean; pending?: boolean; recovered?: boolean };
 export type ActiveReconciliationResult = { sessionId: string; session?: SessionSnapshot; error?: string };
 type ExpansionIdentity = { projectId?: string; alias?: string };
@@ -122,7 +122,7 @@ export class SessionExpansionService {
     const option = (await this.candidatesForSession(session)).find((candidate) => candidate.projectId === input.projectId);
     if (!option) throw new Error(`Project ${input.projectId} is not eligible for this session`);
     if (!option.member) this.deps.store.enrollRepository(session.workspaceId!, { projectId: option.projectId, alias: option.alias });
-    const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason ?? "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
+    const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason ?? "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey, baseRef: input.baseRef });
     if (!claim.claimed) return this.replayForRequest(claim.expansion, session, option);
     try {
       const result = await this.provision(session.id, option, input.requestKey);
@@ -138,11 +138,12 @@ export class SessionExpansionService {
       this.deps.store.finishProvisionedExpansion(requestKey);
       return this.success(session.id, option.alias, requestKey);
     }
+    const requestedBase = this.deps.store.getExpansionByRequestKey(requestKey)?.baseRef ?? DEFAULT_BASE_REF;
     this.deps.store.setExpansionPhase(requestKey, "provisioning");
     if (session.repositories.length >= MAX_SESSION_REPOSITORIES) throw new Error(`Session repository limit is ${MAX_SESSION_REPOSITORIES}`);
     let added;
     try {
-      added = await this.deps.addRepository({ sessionId: session.id, operationKey: requestKey, instructions: session.instructions, repository: { projectId: option.projectId, alias: option.alias, sourcePath: option.sourcePath, baseRef: "HEAD" } }, session.hostId!);
+      added = await this.deps.addRepository({ sessionId: session.id, operationKey: requestKey, instructions: session.instructions, repository: { projectId: option.projectId, alias: option.alias, sourcePath: option.sourcePath, baseRef: requestedBase } }, session.hostId!);
     } catch (error) {
       if (this.isAbort(error)) {
         this.deps.store.setExpansionPhase(requestKey, "uncertain");

@@ -62,6 +62,7 @@ type ExpansionRow = {
   reason: string;
   requester: ExpansionRequester;
   approval_mode: ExpansionApprovalMode;
+  base_ref: string | null;
   outcome: ExpansionOutcome;
   phase: ExpansionPhase | null;
   request_key: string;
@@ -78,6 +79,7 @@ export type BeginExpansionInput = {
   requester: ExpansionRequester;
   approvalMode: ExpansionApprovalMode;
   requestKey: string;
+  baseRef?: string;
 };
 
 export type ExpansionClaim = {
@@ -158,6 +160,8 @@ export const WORKSPACE_MIGRATIONS = [`
   ALTER TABLE session_expansions ADD COLUMN phase TEXT;
 `, `
   ALTER TABLE sessions ADD COLUMN name TEXT;
+`, `
+  ALTER TABLE session_expansions ADD COLUMN base_ref TEXT;
 `];
 
 const WORKSPACE_PROJECT_ID_METADATA_KEY = "workspace-project-id";
@@ -372,9 +376,9 @@ export class WorkspaceStore {
       const now = Date.now();
       const id = `expansion_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       this.db.prepare(`INSERT INTO session_expansions
-        (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at, phase)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?, ?)`)
-        .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now, input.requester === "user" ? "approved" : "awaiting-approval");
+        (id, session_id, project_id, alias, reason, requester, approval_mode, outcome, request_key, error, created_at, updated_at, phase, base_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?, ?, ?)`)
+        .run(id, input.sessionId, input.projectId, input.alias, input.reason, input.requester, input.approvalMode, input.requestKey, now, now, input.requester === "user" ? "approved" : "awaiting-approval", input.baseRef ?? null);
       return { expansion: this.hydrateExpansion(this.db.prepare("SELECT * FROM session_expansions WHERE id = ?").get(id) as ExpansionRow), claimed: true };
     })();
   }
@@ -548,6 +552,7 @@ export class WorkspaceStore {
       reason: row.reason,
       requester: row.requester,
       approvalMode: row.approval_mode,
+      baseRef: row.base_ref ?? null,
       outcome: row.outcome,
       phase: row.phase ?? null,
       requestKey: row.request_key,

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { EXPANSION_ERROR_MAX_CHARS, expansionApprovalResponseSchema, workspaceDraftSchema } from "./src/contracts";
+import { baseRefSchema, DEFAULT_BASE_REF, EXPANSION_ERROR_MAX_CHARS, MAX_BASE_REFS, expansionApprovalResponseSchema, workspaceDraftSchema } from "./src/contracts";
 import { hostContract } from "./src/host-contract";
 import { SessionExpansionService, type ExpansionResult } from "./src/session-expansion";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "./src/store";
@@ -19,7 +19,7 @@ const sessionRepositorySchema = z.object({
 });
 const sessionExpansionSchema = z.object({
   id: z.string(), sessionId: z.string(), projectId: z.string(), alias: z.string(), reason: z.string(),
-  requester: z.enum(["agent", "user", "reconcile"]), approvalMode: z.enum(["once", "auto", "manual", "reconciled"]),
+  requester: z.enum(["agent", "user", "reconcile"]), approvalMode: z.enum(["once", "auto", "manual", "reconciled"]), baseRef: z.string().nullable(),
   outcome: z.enum(["pending", "cancelled", "failed", "provisioned", "superseded"]), requestKey: z.string(), error: z.string().max(EXPANSION_ERROR_MAX_CHARS).nullable(),
   phase: z.enum(["awaiting-approval", "approved", "provisioning", "uncertain"]).nullable(),
   createdAt: z.number().int(), updatedAt: z.number().int(),
@@ -59,8 +59,18 @@ export const rpcContract = defineRpcContract({
       projectIds: z.array(z.string()).min(1).max(20), prompt: z.string().trim().min(1).max(100_000),
       name: z.string().trim().min(1).max(80).optional(),
       requestKey: z.string().min(8).max(200),
+      bases: z.record(z.string(), baseRefSchema).optional(),
     }),
     output: sessionSchema,
+  },
+  repository_bases: {
+    input: z.object({ hostId: z.string(), projectIds: z.array(z.string()).min(1).max(20), fetch: z.boolean() }).strict(),
+    output: z.object({
+      repositories: z.array(z.object({
+        projectId: z.string(), defaultBase: z.string(), currentBranch: z.string().nullable(),
+        currentCommit: z.string(), refs: z.array(z.string()).max(MAX_BASE_REFS), fetchError: z.string().nullable(),
+      }).strict()),
+    }).strict(),
   },
   session_archive: { input: z.object({ id: z.string() }), output: sessionSchema },
   session_rename: {
@@ -81,7 +91,7 @@ export const rpcContract = defineRpcContract({
   },
   session_add_repository: {
     input: z.object({
-      threadId: z.string(), projectId: z.string(), requestKey: z.string().min(8).max(200),
+      threadId: z.string(), projectId: z.string(), requestKey: z.string().min(8).max(200), baseRef: baseRefSchema.optional(),
     }).strict(),
     output: expansionResultSchema,
   },
@@ -273,7 +283,7 @@ export default async function plugin(bb: BbPluginApi) {
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
-    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey }) => {
+    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey, bases }) => {
       const existing = store.getSessionByRequestKey(requestKey);
       if (existing) return existing;
       const workspace = store.get(workspaceId);
@@ -293,7 +303,7 @@ export default async function plugin(bb: BbPluginApi) {
         const source = project.sources.find((candidate) => candidate.hostId === hostId && candidate.isDefault)
           ?? project.sources.find((candidate) => candidate.hostId === hostId);
         if (!source) throw new Error(`${project.name} has no source on the selected host`);
-        return { ...repository, sourceId: source.id, sourcePath: source.path, baseRef: "HEAD" };
+        return { ...repository, sourceId: source.id, sourcePath: source.path, baseRef: bases?.[repository.projectId] ?? DEFAULT_BASE_REF };
       });
       const workspaceOwnerProjectId = await workspaceProject(hostId);
       if (selected.some((repository) => repository.projectId === workspaceOwnerProjectId)) {
@@ -375,10 +385,22 @@ export default async function plugin(bb: BbPluginApi) {
       const reconciled = await expansion.reconcileSession(session.id);
       return { session: reconciled, repositories: await expansion.candidatesForThread(threadId) };
     },
-    session_add_repository: async ({ threadId, projectId, requestKey }) => {
+    session_add_repository: async ({ threadId, projectId, requestKey, baseRef }) => {
       return resultWithSession(await expansion.addManually({
-        threadId, projectId, requestKey, reason: "Added from the Repositories panel",
+        threadId, projectId, requestKey, baseRef, reason: "Added from the Repositories panel",
       }));
+    },
+    repository_bases: async ({ hostId, projectIds, fetch }) => {
+      const available = new Map((await projects()).map((project) => [project.id, project]));
+      const repositories = projectIds.map((projectId) => {
+        const project = available.get(projectId);
+        if (!project) throw new Error(`BB project ${projectId} was not found`);
+        const source = project.sources.find((candidate) => candidate.hostId === hostId && candidate.isDefault)
+          ?? project.sources.find((candidate) => candidate.hostId === hostId);
+        if (!source) throw new Error(`${project.name} has no source on the selected host`);
+        return { projectId, sourcePath: source.path };
+      });
+      return host.call("repository_bases", { repositories, fetch }, { hostId });
     },
   });
 

@@ -2,6 +2,16 @@ import { z } from "zod";
 
 export const MAX_WORKSPACE_REPOSITORIES = 100;
 
+/** Asks the host to resolve each repository's own default branch at provisioning time. */
+export const DEFAULT_BASE_REF = "@default";
+export const MAX_BASE_REFS = 200;
+
+/** Git ref names accepted from the UI. Leading dashes are refused so a ref can never act as a git flag. */
+export const baseRefSchema = z.union([
+  z.literal(DEFAULT_BASE_REF),
+  z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/, "Invalid base ref"),
+]);
+
 export const repositoryDraftSchema = z.object({
   projectId: z.string().trim().min(1),
   alias: z.string().trim().regex(/^[a-z][a-z0-9-]{0,47}$/, "Invalid repository alias"),
@@ -102,6 +112,7 @@ export type SessionExpansion = {
   reason: string;
   requester: ExpansionRequester;
   approvalMode: ExpansionApprovalMode;
+  baseRef: string | null;
   outcome: ExpansionOutcome;
   phase: ExpansionPhase | null;
   requestKey: string;

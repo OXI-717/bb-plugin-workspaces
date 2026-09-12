@@ -9,9 +9,11 @@ import {
   cleanupSession,
   ensureAnchor,
   prepareSession,
+  readRepositoryBases,
   readRepositoryStatus,
   readSessionManifest,
 } from "../src/worktrees";
+import { DEFAULT_BASE_REF } from "../src/contracts";
 
 const roots: string[] = [];
 
@@ -35,7 +37,73 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+
+/** A clone whose origin has advanced past what the working copy has checked out. */
+function clonedRepository(name: string): { path: string; originPath: string; defaultCommit: string; featureCommit: string } {
+  const origin = repository(name);
+  git(origin.path, "branch", "-M", "master");
+  const clonePath = mkdtempSync(join(tmpdir(), `bb-workspaces-${name}-clone-`));
+  roots.push(clonePath);
+  execFileSync("git", ["clone", "--quiet", origin.path, clonePath], { encoding: "utf8" });
+  git(clonePath, "config", "user.email", "workspaces@example.invalid");
+  git(clonePath, "config", "user.name", "Workspaces test");
+  git(clonePath, "checkout", "--quiet", "-b", "feature/work");
+  writeFileSync(join(clonePath, "feature.md"), "feature\n");
+  git(clonePath, "add", "feature.md");
+  git(clonePath, "commit", "-m", "feature work");
+  const featureCommit = git(clonePath, "rev-parse", "HEAD");
+  writeFileSync(join(origin.path, "AFTER.md"), "later master work\n");
+  git(origin.path, "add", "AFTER.md");
+  git(origin.path, "commit", "-m", "master moved on");
+  return { path: clonePath, originPath: origin.path, defaultCommit: git(origin.path, "rev-parse", "HEAD"), featureCommit };
+}
+
 describe("multi-repository session worktrees", () => {
+  it("branches from the freshly fetched default branch and leaves the checkout alone", async () => {
+    const clone = clonedRepository("default-base");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_default", workspaceName: "Platform", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: clone.path, baseRef: DEFAULT_BASE_REF }],
+    });
+    expect(prepared.repositories[0]).toMatchObject({ baseRef: "origin/master", baseCommit: clone.defaultCommit });
+    expect(git(prepared.repositories[0]!.worktreePath, "rev-parse", "HEAD")).toBe(clone.defaultCommit);
+    expect(git(clone.path, "symbolic-ref", "--short", "HEAD")).toBe("feature/work");
+    expect(git(clone.path, "rev-parse", "HEAD")).toBe(clone.featureCommit);
+  });
+
+  it("branches from the current checkout when that base is chosen", async () => {
+    const clone = clonedRepository("current-base");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_current", workspaceName: "Platform", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: clone.path, baseRef: "feature/work" }],
+    });
+    expect(prepared.repositories[0]).toMatchObject({ baseRef: "feature/work", baseCommit: clone.featureCommit });
+  });
+
+  it("reports the default branch, the current checkout, and candidate refs", async () => {
+    const clone = clonedRepository("bases");
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: clone.path }], fetch: true });
+    expect(bases).toMatchObject({ projectId: "svc", defaultBase: "origin/master", currentBranch: "feature/work", fetchError: null });
+    expect(bases!.refs).toContain("origin/master");
+    expect(bases!.refs).toContain("feature/work");
+    expect(bases!.refs.every((ref) => !ref.endsWith("/HEAD"))).toBe(true);
+  });
+
+  it("refuses a base ref that could act as a git flag", async () => {
+    const clone = clonedRepository("unsafe-base");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_unsafe", workspaceName: "Platform", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: clone.path, baseRef: "--upload-pack=touch" }],
+    })).rejects.toThrow();
+  });
+
+
   it("preserves trusted initial instructions when expanding a v1 manifest", async () => {
     const auth = repository("legacy-auth");
     const audits = repository("legacy-audits");

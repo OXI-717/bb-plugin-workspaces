@@ -30,6 +30,8 @@ session root/
 
 The thread's **Repositories** panel reports each checkout independently, including changed files and commits ahead of the session base. Its **Add repository** action offers the workspace repositories missing from this session, plus every other BB project checked out on the session's host. Picking a workspace repository expands the active session only (append-only). Picking any other project enrolls it in the saved workspace first — under the alias shown in the picker — and then checks it out here, so one action covers both.
 
+Every worktree branches from the repository's own default branch (`origin/HEAD`, normally `origin/master`), fetched immediately before the branch is cut. Your source clone is never modified: no pull, no checkout, no stash — only remote-tracking refs are refreshed. Session start and the **Add repository** form both offer a per-repository **Branch from** selector to override that with your current checkout or any other ref; the chosen base is recorded per repository and shown in the Repositories panel. A fetch that fails or times out falls back to the last fetched commit rather than blocking the session.
+
 Agent requests to add a repository default to approval. Choosing auto-approval applies only to that session and only to repositories that are current members of the saved workspace on the session's host; it never changes the workspace default or other sessions.
 
 An initial selection can contain up to 20 repositories. An active session can accumulate up to 1,024 repositories (`MAX_SESSION_REPOSITORIES`); expansion checks this limit before provisioning, and cleanup accepts the same accumulated limit.
