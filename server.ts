@@ -37,7 +37,7 @@ const projectSchema = z.object({
   sources: z.array(z.object({ id: z.string(), hostId: z.string(), path: z.string(), isDefault: z.boolean() })),
 });
 const expansionOptionSchema = z.object({
-  projectId: z.string(), alias: z.string(), projectName: z.string(), sourcePath: z.string(),
+  projectId: z.string(), alias: z.string(), projectName: z.string(), sourcePath: z.string(), member: z.boolean(),
 }).strict();
 const expansionResultSchema = z.object({
   outcome: z.enum(["pending", "cancelled", "failed", "provisioned", "superseded"]),
@@ -373,7 +373,7 @@ export default async function plugin(bb: BbPluginApi) {
       const session = store.getSessionByThreadId(threadId);
       if (!session) throw new Error("This thread is not a workspace session");
       const reconciled = await expansion.reconcileSession(session.id);
-      return { session: reconciled, repositories: await expansion.optionsForThread(threadId) };
+      return { session: reconciled, repositories: await expansion.candidatesForThread(threadId) };
     },
     session_add_repository: async ({ threadId, projectId, requestKey }) => {
       return resultWithSession(await expansion.addManually({

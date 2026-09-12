@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { WORKSPACE_MIGRATIONS, WorkspaceStore } from "../src/store";
+import { MAX_WORKSPACE_REPOSITORIES } from "../src/contracts";
 
 const createStore = (): { db: Database.Database; store: WorkspaceStore } => {
   const db = new Database(":memory:");
@@ -9,6 +10,35 @@ const createStore = (): { db: Database.Database; store: WorkspaceStore } => {
 };
 
 describe("WorkspaceStore", () => {
+  it("enrolls a new repository, bumps the revision, and stays idempotent", () => {
+    const { store } = createStore();
+    const workspace = store.create({ name: "Platform", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    const enrolled = store.enrollRepository(workspace.id, { projectId: "b", alias: "billing" });
+    expect(enrolled.repositories).toEqual([
+      { projectId: "a", alias: "api", ordinal: 0 },
+      { projectId: "b", alias: "billing", ordinal: 1 },
+    ]);
+    expect(enrolled.revision).toBe(workspace.revision + 1);
+    expect(store.enrollRepository(workspace.id, { projectId: "b", alias: "billing" }).revision).toBe(enrolled.revision);
+  });
+
+  it("rejects an enrollment that collides with existing workspace membership", () => {
+    const { store } = createStore();
+    const workspace = store.create({ name: "Platform", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });
+    expect(() => store.enrollRepository(workspace.id, { projectId: "b", alias: "api" })).toThrow(/Duplicate repository alias/);
+    expect(() => store.enrollRepository(workspace.id, { projectId: "a", alias: "gateway" })).toThrow(/already in this workspace as api/);
+    expect(store.get(workspace.id).repositories).toHaveLength(1);
+  });
+
+  it("enforces the workspace repository limit when enrolling", () => {
+    const { store } = createStore();
+    const workspace = store.create({
+      name: "Platform", description: "", instructions: "",
+      repositories: Array.from({ length: MAX_WORKSPACE_REPOSITORIES }, (_unused, index) => ({ projectId: `p${index}`, alias: `repo-${index}` })),
+    });
+    expect(() => store.enrollRepository(workspace.id, { projectId: "extra", alias: "extra" })).toThrow(/limit/i);
+  });
+
   it("bounds historical journal errors when hydrating migrated rows", () => {
     const { db, store } = createStore();
     const workspace = store.create({ name: "Legacy", description: "", instructions: "", repositories: [{ projectId: "a", alias: "api" }] });

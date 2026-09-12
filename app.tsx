@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc, type PluginPendingInteractionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
+import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, uniqueAlias, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -15,7 +15,7 @@ type Project = {
   sources: Array<{ id: string; hostId: string; path: string; isDefault: boolean }>;
 };
 type Dashboard = { workspaces: Workspace[]; sessions: SessionSnapshot[]; projects: Project[] };
-type ExpansionOption = { projectId: string; alias: string; projectName: string; sourcePath: string };
+type ExpansionOption = { projectId: string; alias: string; projectName: string; sourcePath: string; member: boolean };
 
 const fieldClass = "w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring";
 
@@ -33,11 +33,6 @@ function useDashboard() {
   useEffect(load, [load]);
   useRealtime("workspaces-changed", load);
   return { rpc, dashboard, error, setError, load };
-}
-
-function aliasFor(name: string): string {
-  const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
-  return /^[a-z]/.test(normalized) ? normalized : `repo-${normalized || "project"}`.slice(0, 48);
 }
 
 function WorkspaceForm({ projects, initial, onCancel, onSave }: {
@@ -103,10 +98,7 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
       const used = new Set<string>();
       const repositories = projects.filter((project) => selected.has(project.id)).map((project) => {
         const existing = initial?.repositories.find((repo) => repo.projectId === project.id)?.alias;
-        const base = existing ?? aliasFor(project.name);
-        let alias = base;
-        let suffix = 2;
-        while (used.has(alias)) alias = `${base.slice(0, 44)}-${suffix++}`;
+        const alias = existing && !used.has(existing) ? existing : uniqueAlias(project.name, used);
         used.add(alias);
         return { projectId: project.id, alias };
       });
@@ -431,7 +423,10 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const activeForAddition = session.state === "active" && optionsSessionState === "active";
   const displayedOptions = submittedOption.current && !options?.some((option) => option.projectId === submittedOption.current!.projectId)
     ? [...(options ?? []), submittedOption.current] : options;
-  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Editing this workspace changes future repository eligibility; it does not change this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">All current workspace repositories are already available.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{displayedOptions?.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</select></label><Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button></form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p></div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
+  const memberOptions = displayedOptions?.filter((option) => option.member) ?? [];
+  const otherOptions = displayedOptions?.filter((option) => !option.member) ?? [];
+  const pendingOption = displayedOptions?.find((option) => option.projectId === selectedProjectId);
+  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">Every project on this session’s host is already checked out here.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{memberOptions.length ? <optgroup label="In this workspace">{memberOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}{otherOptions.length ? <optgroup label="Other projects">{otherOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}</select></label><Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button>{pendingOption && !pendingOption.member ? <p className="w-full text-xs text-muted-foreground">{pendingOption.projectName} also joins workspace “{session.workspaceName}” as {pendingOption.alias}.</p> : null}</form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p></div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
 }
 
 export default definePluginApp((app) => {

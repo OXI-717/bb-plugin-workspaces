@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
+  repositoryDraftSchema,
   workspaceDraftSchema,
   EXPANSION_ERROR_MAX_CHARS,
+  MAX_WORKSPACE_REPOSITORIES,
   type ExpansionPhase,
   type ExpansionApprovalMode,
   type ExpansionOutcome,
@@ -204,6 +206,25 @@ export class WorkspaceStore {
       this.replaceRepositories(id, draft.repositories);
     })();
     return this.get(id);
+  }
+
+  /** Appends one repository to a saved workspace. Append-only, so it needs no revision guard. */
+  enrollRepository(workspaceId: string, repository: RepositoryDraft): Workspace {
+    const draft = repositoryDraftSchema.parse(repository);
+    this.db.transaction(() => {
+      const workspace = this.get(workspaceId);
+      const enrolled = workspace.repositories.find((candidate) => candidate.projectId === draft.projectId);
+      if (enrolled) {
+        if (enrolled.alias !== draft.alias) throw new Error(`Project ${draft.projectId} is already in this workspace as ${enrolled.alias}`);
+        return;
+      }
+      if (workspace.repositories.some((candidate) => candidate.alias === draft.alias)) throw new Error(`Duplicate repository alias: ${draft.alias}`);
+      if (workspace.repositories.length >= MAX_WORKSPACE_REPOSITORIES) throw new Error(`Workspace repository limit is ${MAX_WORKSPACE_REPOSITORIES}`);
+      this.db.prepare("INSERT INTO workspace_repositories (workspace_id, project_id, alias, ordinal) VALUES (?, ?, ?, ?)")
+        .run(workspaceId, draft.projectId, draft.alias, workspace.repositories.length);
+      this.db.prepare("UPDATE workspaces SET revision = revision + 1, updated_at = ? WHERE id = ?").run(Date.now(), workspaceId);
+    })();
+    return this.get(workspaceId);
   }
 
   setPinned(id: string, expectedRevision: number, pinned: boolean): Workspace {

@@ -1,9 +1,11 @@
 import { z } from "zod";
-import { MAX_SESSION_REPOSITORIES, EXPANSION_ERROR_MAX_CHARS, expansionApprovalPayloadSchema, expansionApprovalResponseSchema, type ExpansionOutcome, type SessionExpansion, type SessionRepository, type SessionSnapshot } from "./contracts";
+import { uniqueAlias, MAX_SESSION_REPOSITORIES, MAX_WORKSPACE_REPOSITORIES, EXPANSION_ERROR_MAX_CHARS, expansionApprovalPayloadSchema, expansionApprovalResponseSchema, type ExpansionOutcome, type SessionExpansion, type SessionRepository, type SessionSnapshot } from "./contracts";
 import type { WorkspaceStore } from "./store";
 
 export type ExpansionProject = { id: string; name: string; sources: Array<{ id: string; hostId: string; path: string; isDefault: boolean }> };
 export type ExpansionOption = { projectId: string; alias: string; projectName: string; sourcePath: string };
+/** A member candidate is already in the saved workspace; a non-member is enrolled when the user picks it. */
+export type ExpansionCandidate = ExpansionOption & { member: boolean };
 export type ExpansionHostRepository = SessionRepository & { sourcePath: string; baseRef: string; baseCommit: string; branch: string; worktreePath: string };
 export type SessionManifest = { revision: number; repositories: ExpansionHostRepository[]; operations: Array<{ key: string; projectId: string; alias: string }> };
 export type SessionExpansionDeps = {
@@ -20,6 +22,13 @@ export type ManualExpansionRequest = { threadId: string; projectId: string; requ
 export type ExpansionResult = { added: boolean; outcome: ExpansionOutcome; error: string | null; alias: string; policy: "ask" | "auto"; session: SessionSnapshot; cancelled?: boolean; pending?: boolean; recovered?: boolean };
 export type ActiveReconciliationResult = { sessionId: string; session?: SessionSnapshot; error?: string };
 type ExpansionIdentity = { projectId?: string; alias?: string };
+type SessionEligibility = {
+  workspace: ReturnType<WorkspaceStore["get"]>;
+  hostId: string;
+  projects: Map<string, ExpansionProject>;
+  presentProjects: Set<string>;
+  presentAliases: Set<string>;
+};
 
 const requestKeySchema = z.string().min(8).max(200);
 const reasonSchema = z.string().min(1).max(2_000);
@@ -31,9 +40,11 @@ export class SessionExpansionService {
   constructor(private readonly deps: SessionExpansionDeps) {}
 
   async optionsForThread(threadId: string): Promise<ExpansionOption[]> {
-    const session = this.deps.store.getSessionByThreadId(threadId);
-    if (!session) throw new Error("This thread is not a workspace session");
-    return this.optionsForSession(session);
+    return this.optionsForSession(this.sessionForOptions(threadId));
+  }
+
+  async candidatesForThread(threadId: string): Promise<ExpansionCandidate[]> {
+    return this.candidatesForSession(this.sessionForOptions(threadId));
   }
 
   requestFromAgent(input: AgentExpansionRequest): Promise<ExpansionResult> {
@@ -108,8 +119,9 @@ export class SessionExpansionService {
   private async addManuallyOnce(session: SessionSnapshot, input: ManualExpansionRequest): Promise<ExpansionResult> {
     const replay = this.deps.store.getExpansionByRequestKey(input.requestKey);
     if (replay) return this.replayForRequest(replay, session, { projectId: input.projectId });
-    const option = (await this.optionsForSession(session)).find((candidate) => candidate.projectId === input.projectId);
+    const option = (await this.candidatesForSession(session)).find((candidate) => candidate.projectId === input.projectId);
     if (!option) throw new Error(`Project ${input.projectId} is not eligible for this session`);
+    if (!option.member) this.deps.store.enrollRepository(session.workspaceId!, { projectId: option.projectId, alias: option.alias });
     const claim = this.deps.store.claimExpansion({ sessionId: session.id, projectId: option.projectId, alias: option.alias, reason: input.reason ?? "Added manually by a workspace member.", requester: "user", approvalMode: "manual", requestKey: input.requestKey });
     if (!claim.claimed) return this.replayForRequest(claim.expansion, session, option);
     try {
@@ -244,23 +256,65 @@ export class SessionExpansionService {
     return { session, option: { projectId: project.id, alias: member.alias, projectName: project.name, sourcePath: source.path } };
   }
 
-  private async optionsForSession(session: SessionSnapshot): Promise<ExpansionOption[]> {
+  private sessionForOptions(threadId: string): SessionSnapshot {
+    const session = this.deps.store.getSessionByThreadId(threadId);
+    if (!session) throw new Error("This thread is not a workspace session");
+    return session;
+  }
+
+  private async eligibility(session: SessionSnapshot): Promise<SessionEligibility> {
     if (session.repositories.length >= MAX_SESSION_REPOSITORIES) throw new Error(`Session repository limit is ${MAX_SESSION_REPOSITORIES}`);
     if (session.state !== "active") throw new Error("Only active workspace sessions can add repositories");
     if (!session.workspaceId) throw new Error("The saved workspace is unavailable");
     if (!session.hostId) throw new Error("Session host is unavailable");
     let workspace;
     try { workspace = this.deps.store.get(session.workspaceId); } catch { throw new Error("The saved workspace no longer exists"); }
-    const projects = new Map((await this.deps.listProjects()).map((project) => [project.id, project]));
-    const presentProjects = new Set(session.repositories.map((repository) => repository.projectId));
-    const presentAliases = new Set(session.repositories.map((repository) => repository.alias));
-    return workspace.repositories.flatMap((repository) => {
-      if (presentProjects.has(repository.projectId) || presentAliases.has(repository.alias)) return [];
-      const project = projects.get(repository.projectId);
+    return {
+      workspace,
+      hostId: session.hostId,
+      projects: new Map((await this.deps.listProjects()).map((project) => [project.id, project])),
+      presentProjects: new Set(session.repositories.map((repository) => repository.projectId)),
+      presentAliases: new Set(session.repositories.map((repository) => repository.alias)),
+    };
+  }
+
+  private hostSource(project: ExpansionProject, hostId: string) {
+    return project.sources.find((candidate) => candidate.hostId === hostId && candidate.isDefault)
+      ?? project.sources.find((candidate) => candidate.hostId === hostId);
+  }
+
+  private memberOptions(eligibility: SessionEligibility): ExpansionOption[] {
+    return eligibility.workspace.repositories.flatMap((repository) => {
+      if (eligibility.presentProjects.has(repository.projectId) || eligibility.presentAliases.has(repository.alias)) return [];
+      const project = eligibility.projects.get(repository.projectId);
       if (!project) return [];
-      const source = project.sources.find((candidate) => candidate.hostId === session.hostId && candidate.isDefault) ?? project.sources.find((candidate) => candidate.hostId === session.hostId);
+      const source = this.hostSource(project, eligibility.hostId);
       return source ? [{ projectId: project.id, alias: repository.alias, projectName: project.name, sourcePath: source.path }] : [];
     });
+  }
+
+  private async optionsForSession(session: SessionSnapshot): Promise<ExpansionOption[]> {
+    return this.memberOptions(await this.eligibility(session));
+  }
+
+  /** Members plus every other project checked out on this host, each with the alias enrollment would use. */
+  private async candidatesForSession(session: SessionSnapshot): Promise<ExpansionCandidate[]> {
+    const eligibility = await this.eligibility(session);
+    const members = this.memberOptions(eligibility).map((option) => ({ ...option, member: true }));
+    if (eligibility.workspace.repositories.length >= MAX_WORKSPACE_REPOSITORIES) return members;
+    const enrolled = new Set([...eligibility.presentProjects, ...eligibility.workspace.repositories.map((repository) => repository.projectId)]);
+    const taken = new Set([...eligibility.presentAliases, ...eligibility.workspace.repositories.map((repository) => repository.alias)]);
+    const newcomers: ExpansionCandidate[] = [];
+    for (const project of eligibility.projects.values()) {
+      if (enrolled.has(project.id)) continue;
+      const source = this.hostSource(project, eligibility.hostId);
+      if (!source) continue;
+      const alias = uniqueAlias(project.name, taken);
+      taken.add(alias);
+      newcomers.push({ projectId: project.id, alias, projectName: project.name, sourcePath: source.path, member: false });
+    }
+    newcomers.sort((left, right) => left.projectName.localeCompare(right.projectName));
+    return [...members, ...newcomers];
   }
 
   private success(sessionId: string, alias: string, requestKey: string): ExpansionResult {

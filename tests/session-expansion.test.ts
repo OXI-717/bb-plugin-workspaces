@@ -104,6 +104,38 @@ function addSecondActiveSession(fixture: ReturnType<typeof createFixture>) {
 }
 
 describe("SessionExpansionService", () => {
+  it("offers unenrolled host projects alongside workspace members", async () => {
+    const fixture = createFixture({ projects: [project("proj_api", "API"), project("proj_audits", "Audits"), project("proj_workers", "Workers"), project("proj_remote", "Remote", "host_2")] });
+    expect(await new SessionExpansionService(fixture.deps).candidatesForThread("thr_1")).toEqual([
+      { projectId: "proj_audits", alias: "audits", projectName: "Audits", sourcePath: "/repos/proj_audits", member: true },
+      { projectId: "proj_workers", alias: "workers", projectName: "Workers", sourcePath: "/repos/proj_workers", member: false },
+    ]);
+  });
+
+  it("suffixes a candidate alias that collides with existing membership", async () => {
+    const fixture = createFixture({ projects: [project("proj_api", "API"), project("proj_audits", "Audits"), project("proj_audits_fork", "Audits")] });
+    expect(await new SessionExpansionService(fixture.deps).candidatesForThread("thr_1"))
+      .toMatchObject([{ alias: "audits", member: true }, { projectId: "proj_audits_fork", alias: "audits-2", member: false }]);
+  });
+
+  it("enrolls an unenrolled project into the workspace before provisioning it", async () => {
+    const fixture = createFixture({ projects: [project("proj_api", "API"), project("proj_audits", "Audits"), project("proj_workers", "Workers")] });
+    fixture.deps.readSession = async (sessionId) => manifest(sessionId, [{ projectId: "proj_api", alias: "api" }, { projectId: "proj_workers", alias: "workers" }]);
+    const result = await new SessionExpansionService(fixture.deps).addManually({ threadId: "thr_1", projectId: "proj_workers", requestKey: "enrolling-add" });
+    expect(result).toMatchObject({ added: true, outcome: "provisioned", alias: "workers" });
+    expect(fixture.store.get(fixture.workspace.id).repositories).toContainEqual({ projectId: "proj_workers", alias: "workers", ordinal: 2 });
+    expect(fixture.approvals).toHaveLength(0);
+  });
+
+  it("keeps the agent confined to repositories already saved in the workspace", async () => {
+    const fixture = createFixture({ projects: [project("proj_api", "API"), project("proj_audits", "Audits"), project("proj_workers", "Workers")] });
+    const service = new SessionExpansionService(fixture.deps);
+    await expect(service.requestFromAgent({ threadId: "thr_1", alias: "workers", reason: "Required", requestKey: "agent-newcomer" }))
+      .rejects.toThrow(/not eligible/);
+    expect(fixture.store.get(fixture.workspace.id).repositories).toHaveLength(2);
+    expect(fixture.hostAdds).toHaveLength(0);
+  });
+
   it.each(["approved", "provisioning", "uncertain"])("resumes orphaned %s work during a normal read", async (phase) => {
     const fixture = createFixture();
     fixture.store.beginExpansion({ sessionId: fixture.session.id, projectId: "proj_audits", alias: "audits", reason: "Required", requester: "agent", approvalMode: "once", requestKey: "orphaned-operation" });

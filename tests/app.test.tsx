@@ -60,6 +60,7 @@ const expansionOption = {
   alias: "gateway",
   projectName: "api-gateway",
   sourcePath: "/repos/gateway",
+  member: true,
 };
 
 const billingOption = {
@@ -67,6 +68,7 @@ const billingOption = {
   alias: "billing",
   projectName: "billing-service",
   sourcePath: "/repos/billing",
+  member: true,
 };
 
 function deferred<T>() {
@@ -369,6 +371,26 @@ describe("Repositories panel", () => {
     expect(calls[2]!.requestKey).not.toBe(calls[1]!.requestKey);
     slot.lifecycle.unmount();
   });
+  it("groups unenrolled projects separately and warns that picking one joins the workspace", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const newcomerOption = { projectId: "proj_reporting", alias: "reporting", projectName: "reporting-service", sourcePath: "/repos/reporting", member: false };
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_auth", params: null }, {
+      rpc: {
+        dashboard: () => ({ workspaces: [workspace], sessions: [activeSession], projects: [project, gatewayProject] }),
+        session_expansion_options: () => ({ session: activeSession, repositories: [expansionOption, newcomerOption] }),
+      },
+    });
+
+    fireEvent.click(await slot.findByRole("button", { name: "Add repository" }));
+    const select = await slot.findByLabelText("Repository to add");
+    expect(Array.from(select.querySelectorAll("optgroup"), (group) => group.getAttribute("label"))).toEqual(["In this workspace", "Other projects"]);
+    expect(slot.queryByText(/joins workspace/)).toBeNull();
+
+    fireEvent.change(select, { target: { value: "proj_reporting" } });
+    expect((await slot.findByText(/joins workspace/)).textContent).toBe("reporting-service also joins workspace “Authentication” as reporting.");
+    slot.lifecycle.unmount();
+  });
+
   it("adds a trusted eligible repository once and refreshes the displayed session", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const additions: Array<{ threadId: string; projectId: string; requestKey: string }> = [];
@@ -441,8 +463,8 @@ describe("Repositories panel", () => {
 
     expect(await slot.findByRole("button", { name: "Add repository" })).toBeTruthy();
     await slot.behavior.emitRealtime("workspaces-changed", { at: 2 });
-    expect(await slot.findByText("All current workspace repositories are already available.")).toBeTruthy();
-    expect(slot.getByText("Editing this workspace changes future repository eligibility; it does not change this session.")).toBeTruthy();
+    expect(await slot.findByText("Every project on this session’s host is already checked out here.")).toBeTruthy();
+    expect(slot.getByText("Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -462,7 +484,7 @@ describe("Repositories panel", () => {
     await slot.behavior.emitRealtime("workspaces-changed", { at: 3 });
     await expect.poll(() => calls).toBe(2);
     await act(async () => { realtime.resolve({ session: activeSession, repositories: [] }); await realtime.promise; });
-    expect(await slot.findByText("All current workspace repositories are already available.")).toBeTruthy();
+    expect(await slot.findByText("Every project on this session’s host is already checked out here.")).toBeTruthy();
 
     if (outcome === "resolve") await act(async () => { mount.resolve({ session: activeSession, repositories: [expansionOption] }); await mount.promise; });
     else await act(async () => { mount.reject(new Error("stale mount failure")); await mount.promise.catch(() => {}); });

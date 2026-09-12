@@ -27,6 +27,25 @@ export const workspaceDraftSchema = z.object({
   }
 });
 
+const MAX_ALIAS_LENGTH = 48;
+
+function deriveAlias(projectName: string): string {
+  const normalized = projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, MAX_ALIAS_LENGTH);
+  return /^[a-z]/.test(normalized) ? normalized : `repo-${normalized || "project"}`.slice(0, MAX_ALIAS_LENGTH);
+}
+
+/** Derives the alias BB shows for a project, suffixed until it is free and still valid for repositoryDraftSchema. */
+export function uniqueAlias(projectName: string, taken: ReadonlySet<string>): string {
+  const base = deriveAlias(projectName);
+  let alias = base;
+  let suffix = 2;
+  while (taken.has(alias)) {
+    const tail = `-${suffix++}`;
+    alias = `${base.slice(0, MAX_ALIAS_LENGTH - tail.length)}${tail}`;
+  }
+  return alias;
+}
+
 export type RepositoryDraft = z.infer<typeof repositoryDraftSchema>;
 export type WorkspaceDraft = z.infer<typeof workspaceDraftSchema>;
 

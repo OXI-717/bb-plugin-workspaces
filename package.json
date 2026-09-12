@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-workspaces",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "engines": {
     "bb": ">=0.42",
@@ -15,7 +15,9 @@
     "server": "./server.ts",
     "app": "./app.tsx",
     "host": "./host.ts",
-    "skills": ["skills"]
+    "skills": [
+      "skills"
+    ]
   },
   "scripts": {
     "test": "vitest run",
