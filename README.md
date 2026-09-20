@@ -2,6 +2,8 @@
 
 BB Workspaces groups existing BB projects and launches one agent thread across an isolated checkout of each selected repository.
 
+![The Workspaces page: a workspace, its repositories, and session history](docs/images/overview.png)
+
 The plugin follows a simple model:
 
 - A **workspace** is a reusable, many-to-many grouping of BB projects. It does not modify or replace those projects.
@@ -11,6 +13,8 @@ The plugin follows a simple model:
 - Repository branches survive cleanup. Worktrees are removed only after the session is archived, every working tree is clean, and each checkout is still on its recorded session branch.
 
 ## Use it
+
+![Creating a workspace and picking its repositories](docs/images/repository-picker.png)
 
 Open **Workspaces** in BB's navigation, create a workspace, and select the existing BB projects that belong together. The picker searches hundreds of projects by name or path, filters to selected projects, and supports selecting or clearing visible results while enforcing the 100-repository workspace limit. The workspace navigator searches names, descriptions, and repository aliases; filters active, pinned, and archived workspaces; and progressively renders 50 results at a time. To start a task:
 
@@ -27,6 +31,8 @@ session root/
     identity-service/
     api-gateway/
 ```
+
+![The Repositories panel in a running session](docs/images/session-repositories.png)
 
 The thread's **Repositories** panel reports each checkout independently, including changed files and commits ahead of the session base. Its **Add repository** action offers the workspace repositories missing from this session, plus every other BB project checked out on the session's host. Picking a workspace repository expands the active session only (append-only). Picking any other project enrolls it in the saved workspace first — under the alias shown in the picker — and then checks it out here, so one action covers both.
 
