@@ -57,11 +57,27 @@ export type RepositoryStatus = {
 
 const FETCH_TIMEOUT_MS = 20_000;
 
-async function git(cwd: string, args: string[], timeoutMs?: number): Promise<string> {
+const GH_ACCOUNT_MARKER = ".gh-account";
+const GH_ACCOUNT_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const GH_HOSTNAME = "github.com";
+const AMBIENT_GH_TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+
+// Answers credential queries only for the declared host over HTTPS, resolving the
+// token from gh's auth store at fetch time so it never enters argv, URLs, or logs.
+const REPO_GH_CREDENTIAL_HELPER =
+  '!f() { test "$1" = get || exit 0; protocol=; host=; ' +
+  'while IFS= read -r line && test -n "$line"; do ' +
+  'case "$line" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; ' +
+  'if test "$protocol" = https && test "$host" = "$BB_WS_GH_HOST"; then ' +
+  'token=$(gh auth token --user "$BB_WS_GH_ACCOUNT" --hostname "$BB_WS_GH_HOST" 2>/dev/null) || exit 0; ' +
+  'test -n "$token" || exit 0; ' +
+  'printf "username=x-access-token\\npassword=%s\\n" "$token"; fi; }; f';
+
+async function git(cwd: string, args: string[], timeoutMs?: number, env?: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    env: { ...(env ?? process.env), GIT_TERMINAL_PROMPT: "0" },
     ...(timeoutMs ? { timeout: timeoutMs } : {}),
   });
   return stdout.trim();
@@ -86,10 +102,58 @@ async function listRemotes(sourcePath: string): Promise<string[]> {
   catch { return []; }
 }
 
+/** Env that forces gh to resolve from its local auth store instead of ambient tokens. */
+function ghAuthStoreEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of AMBIENT_GH_TOKEN_VARS) delete env[name];
+  return env;
+}
+
+/**
+ * Fetch environment for a repository. Repositories declaring a `.gh-account` marker
+ * get a scrubbed environment whose appended credential helper resolves that account
+ * through gh's auth store, overriding any injected ambient helper. Repositories
+ * without the marker keep the ambient environment unchanged.
+ */
+async function repositoryFetchEnv(sourcePath: string): Promise<NodeJS.ProcessEnv | undefined> {
+  let marker: string;
+  try {
+    marker = await readFile(join(sourcePath, GH_ACCOUNT_MARKER), "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  const account = marker.split("\n").map((line) => line.trim()).find((line) => line.length > 0) ?? "";
+  if (!GH_ACCOUNT_LOGIN.test(account)) throw new Error(`Invalid ${GH_ACCOUNT_MARKER} marker`);
+  const env = ghAuthStoreEnv();
+  try {
+    const { stdout } = await execFileAsync(
+      "gh", ["auth", "token", "--user", account, "--hostname", GH_HOSTNAME], { env, encoding: "utf8" },
+    );
+    if (stdout.trim().length === 0) throw new Error("empty token");
+  } catch {
+    throw new Error(`Cannot resolve GitHub account "${account}" declared by ${GH_ACCOUNT_MARKER}`);
+  }
+  const count = Number.parseInt(env.GIT_CONFIG_COUNT ?? "", 10);
+  const next = Number.isInteger(count) && count > 0 ? count : 0;
+  env[`GIT_CONFIG_KEY_${next}`] = "credential.helper";
+  env[`GIT_CONFIG_VALUE_${next}`] = "";
+  env[`GIT_CONFIG_KEY_${next + 1}`] = "credential.helper";
+  env[`GIT_CONFIG_VALUE_${next + 1}`] = REPO_GH_CREDENTIAL_HELPER;
+  env.GIT_CONFIG_COUNT = String(next + 2);
+  env.BB_WS_GH_ACCOUNT = account;
+  env.BB_WS_GH_HOST = GH_HOSTNAME;
+  return env;
+}
+
+function firstErrorLine(cause: unknown): string {
+  return (cause instanceof Error ? cause.message : String(cause)).split("\n")[0] ?? "git fetch failed";
+}
+
 /** Refreshes remote-tracking refs. It never touches the checkout, so the user's own branch is unaffected. */
-async function fetchRemote(sourcePath: string, remote: string): Promise<string | null> {
-  try { await git(sourcePath, ["fetch", "--prune", "--quiet", remote], FETCH_TIMEOUT_MS); return null; }
-  catch (cause) { return (cause instanceof Error ? cause.message : String(cause)).split("\n")[0] ?? "git fetch failed"; }
+async function fetchRemote(sourcePath: string, remote: string, env?: NodeJS.ProcessEnv): Promise<string | null> {
+  try { await git(sourcePath, ["fetch", "--prune", "--quiet", remote], FETCH_TIMEOUT_MS, env); return null; }
+  catch (cause) { return firstErrorLine(cause); }
 }
 
 async function defaultBaseRef(sourcePath: string): Promise<string> {
@@ -109,7 +173,12 @@ async function resolveBase(sourcePath: string, requested: string): Promise<{ bas
   baseRefSchema.parse(requested);
   const baseRef = requested === DEFAULT_BASE_REF ? await defaultBaseRef(sourcePath) : requested;
   const remote = remoteOwning(baseRef, await listRemotes(sourcePath));
-  if (remote) await fetchRemote(sourcePath, remote);
+  if (remote) {
+    const env = await repositoryFetchEnv(sourcePath);
+    const failure = await fetchRemote(sourcePath, remote, env);
+    // A repository that declares an account must not silently base on stale refs.
+    if (failure && env !== undefined) throw new Error(failure);
+  }
   return { baseRef, baseCommit: await git(sourcePath, ["rev-parse", "--verify", `${baseRef}^{commit}`]) };
 }
 
@@ -121,9 +190,17 @@ export async function readRepositoryBases(input: {
     const sourcePath = resolve(repository.sourcePath);
     const fetchErrors: string[] = [];
     if (input.fetch) {
-      for (const remote of await listRemotes(sourcePath)) {
-        const failure = await fetchRemote(sourcePath, remote);
-        if (failure) fetchErrors.push(failure);
+      let env: NodeJS.ProcessEnv | undefined;
+      try {
+        env = await repositoryFetchEnv(sourcePath);
+      } catch (cause) {
+        fetchErrors.push(firstErrorLine(cause));
+      }
+      if (fetchErrors.length === 0) {
+        for (const remote of await listRemotes(sourcePath)) {
+          const failure = await fetchRemote(sourcePath, remote, env);
+          if (failure) fetchErrors.push(failure);
+        }
       }
     }
     const listed = await git(sourcePath, [

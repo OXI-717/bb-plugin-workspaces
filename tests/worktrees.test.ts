@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hostContract } from "../src/host-contract";
 import {
   addRepository,
@@ -528,5 +528,257 @@ describe("multi-repository session worktrees", () => {
     git(prepared.repositories[0]!.worktreePath, "switch", "-c", "unexpected-branch");
 
     await expect(cleanupSession({ dataRoot, sessionId: "session_switched", repositories: prepared.repositories })).rejects.toThrow(/recorded session branch/i);
+  });
+});
+
+describe("per-repository fetch credentials", () => {
+  const AMBIENT_TOKEN = "ambient-bm-sentinel";
+  const AMBIENT_HELPER =
+    '!f() { test "$1" = get || exit 0; protocol=; host=; ' +
+    'while IFS= read -r line && test -n "$line"; do ' +
+    'case "$line" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; ' +
+    'if test "$protocol" = https && test "$host" = github.com && test -n "$GH_TOKEN"; then ' +
+    'printf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"; fi; }; f';
+
+  let ghLog = "";
+  let envCapture = "";
+  let savedEnv: NodeJS.ProcessEnv = {};
+
+  beforeEach(() => {
+    savedEnv = { ...process.env };
+    const root = mkdtempSync(join(tmpdir(), "bb-workspaces-auth-"));
+    roots.push(root);
+    const binDir = join(root, "bin");
+    mkdirSync(binDir);
+    ghLog = join(root, "gh.log");
+    envCapture = join(root, "captured.env");
+    writeFileSync(ghLog, "");
+    writeFileSync(join(binDir, "gh"), [
+      "#!/bin/sh",
+      'printf "%s\\n" "$*" >> "$BB_WS_FAKE_GH_LOG"',
+      'if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_ENTERPRISE_TOKEN:-}" ] || [ -n "${GITHUB_ENTERPRISE_TOKEN:-}" ]; then',
+      '  echo "ambient token visible to gh" >&2',
+      "  exit 9",
+      "fi",
+      'user=""; host=""',
+      'while [ "$#" -gt 0 ]; do',
+      '  case "$1" in',
+      '    --user) user="$2"; shift 2 ;;',
+      '    --hostname) host="$2"; shift 2 ;;',
+      "    *) shift ;;",
+      "  esac",
+      "done",
+      'case "$user:$host" in',
+      '  repo-account:github.com) printf "%s\\n" "test-token-repo-account" ;;',
+      '  other-account:github.com) printf "%s\\n" "test-token-other-account" ;;',
+      "  *) exit 7 ;;",
+      "esac",
+      "",
+    ].join("\n"));
+    writeFileSync(join(binDir, "bb-capture-env"), [
+      "#!/bin/sh",
+      'env | sort > "$BB_WS_ENV_CAPTURE"',
+      "exit 1",
+      "",
+    ].join("\n"));
+    chmodSync(join(binDir, "gh"), 0o755);
+    chmodSync(join(binDir, "bb-capture-env"), 0o755);
+    process.env.PATH = `${binDir}:${process.env.PATH}`;
+    process.env.GH_TOKEN = AMBIENT_TOKEN;
+    process.env.GITHUB_TOKEN = AMBIENT_TOKEN;
+    process.env.BB_WS_FAKE_GH_LOG = ghLog;
+    process.env.BB_WS_ENV_CAPTURE = envCapture;
+    process.env.GIT_CONFIG_COUNT = "4";
+    process.env.GIT_CONFIG_KEY_0 = "credential.helper";
+    process.env.GIT_CONFIG_VALUE_0 = "";
+    process.env.GIT_CONFIG_KEY_1 = "credential.helper";
+    process.env.GIT_CONFIG_VALUE_1 = AMBIENT_HELPER;
+    process.env.GIT_CONFIG_KEY_2 = "url.https://github.com/.insteadOf";
+    process.env.GIT_CONFIG_VALUE_2 = "git@github.com:";
+    process.env.GIT_CONFIG_KEY_3 = "url.https://github.com/.insteadOf";
+    process.env.GIT_CONFIG_VALUE_3 = "ssh://git@github.com/";
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+  });
+
+  function markedRepository(name: string, account: string, remote = "ext::bb-capture-env"): { path: string; commit: string } {
+    const repo = repository(name);
+    writeFileSync(join(repo.path, ".gh-account"), `${account}\n`);
+    git(repo.path, "config", "protocol.ext.allow", "always");
+    git(repo.path, "remote", "add", "origin", remote);
+    return repo;
+  }
+
+  function capturedEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const line of readFileSync(envCapture, "utf8").split("\n")) {
+      const separator = line.indexOf("=");
+      if (separator > 0) env[line.slice(0, separator)] = line.slice(separator + 1);
+    }
+    return env;
+  }
+
+  function credentialFill(repoPath: string, env: Record<string, string>, query: string): string {
+    try {
+      return execFileSync("git", ["-C", repoPath, "credential", "fill"], {
+        encoding: "utf8",
+        env: { ...env, GIT_TERMINAL_PROMPT: "0" },
+        input: query,
+      });
+    } catch (error) {
+      const stderr = typeof error === "object" && error !== null && "stderr" in error ? String(error.stderr) : "";
+      return stderr;
+    }
+  }
+
+  it("resolves the marker account through gh and overrides the ambient credential helper", async () => {
+    const repo = markedRepository("marker-fetch", "repo-account");
+
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+
+    expect(bases!.fetchError).toBeTruthy();
+    expect(bases!.fetchError).not.toContain("test-token");
+    expect(bases!.fetchError).not.toContain(AMBIENT_TOKEN);
+    const env = capturedEnv();
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
+    expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+    expect(env.BB_WS_GH_ACCOUNT).toBe("repo-account");
+    expect(env.BB_WS_GH_HOST).toBe("github.com");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GIT_CONFIG_COUNT).toBe("6");
+    expect(env.GIT_CONFIG_KEY_4).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_4).toBe("");
+    expect(env.GIT_CONFIG_KEY_5).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_5).not.toContain("test-token");
+    expect(env.GIT_CONFIG_KEY_2).toBe("url.https://github.com/.insteadOf");
+
+    const fill = credentialFill(repo.path, env, "protocol=https\nhost=github.com\n\n");
+    expect(fill).toContain("username=x-access-token");
+    expect(fill).toContain("password=test-token-repo-account");
+
+    const log = readFileSync(ghLog, "utf8");
+    expect(log).toContain("auth token --user repo-account --hostname github.com");
+    expect(log).not.toContain("test-token");
+    expect(log).not.toContain(AMBIENT_TOKEN);
+  });
+
+  it("selects a different account for each repository marker", async () => {
+    const first = markedRepository("acct-first", "repo-account");
+    const second = markedRepository("acct-second", "other-account");
+
+    await readRepositoryBases({ repositories: [{ projectId: "a", sourcePath: first.path }], fetch: true });
+    const firstEnv = capturedEnv();
+    unlinkSync(envCapture);
+    await readRepositoryBases({ repositories: [{ projectId: "b", sourcePath: second.path }], fetch: true });
+    const secondEnv = capturedEnv();
+
+    expect(firstEnv.BB_WS_GH_ACCOUNT).toBe("repo-account");
+    expect(secondEnv.BB_WS_GH_ACCOUNT).toBe("other-account");
+    expect(credentialFill(first.path, firstEnv, "protocol=https\nhost=github.com\n\n")).toContain("password=test-token-repo-account");
+    expect(credentialFill(second.path, secondEnv, "protocol=https\nhost=github.com\n\n")).toContain("password=test-token-other-account");
+  });
+
+  it("scopes the marker helper to HTTPS on the declared host", async () => {
+    const repo = markedRepository("scoped", "repo-account");
+
+    await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+    const env = capturedEnv();
+
+    const otherHost = credentialFill(repo.path, env, "protocol=https\nhost=example.org\n\n");
+    expect(otherHost).not.toContain("password=");
+    expect(otherHost).toContain("terminal prompts disabled");
+    expect(credentialFill(repo.path, env, "protocol=ssh\nhost=github.com\n\n")).not.toContain("password=");
+  });
+
+  it("fails closed when the marker account is not in the gh auth store", async () => {
+    const repo = markedRepository("ghost", "ghost-account");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+
+    expect(bases!.fetchError).toContain('Cannot resolve GitHub account "ghost-account"');
+    expect(bases!.fetchError).not.toContain("test-token");
+    expect(bases!.fetchError).not.toContain(AMBIENT_TOKEN);
+    expect(existsSync(envCapture)).toBe(false);
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_ghost", workspaceName: "Ghost", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: "origin/main" }],
+    })).rejects.toThrow(/Cannot resolve GitHub account "ghost-account"/);
+    expect(existsSync(join(dataRoot, "sessions", "session_ghost"))).toBe(false);
+  });
+
+  it("fails closed on an invalid marker instead of falling back to ambient auth", async () => {
+    const repo = markedRepository("bad-marker", "not an account!!");
+
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+
+    expect(bases!.fetchError).toContain("Invalid .gh-account marker");
+    expect(existsSync(envCapture)).toBe(false);
+  });
+
+  it("refuses to base a session on a stale ref when a marker repository cannot fetch", async () => {
+    const repo = markedRepository("stale-base", "repo-account");
+    git(repo.path, "update-ref", "refs/remotes/origin/main", "HEAD");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_stale", workspaceName: "Stale", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: "origin/main" }],
+    })).rejects.toThrow();
+    expect(existsSync(join(dataRoot, "sessions", "session_stale"))).toBe(false);
+    expect(git(repo.path, "branch", "--list", "bb-workspace/session-stale/*")).toBe("");
+  });
+
+  it("keeps the ambient environment for repositories without a marker", async () => {
+    const repo = repository("plain-fetch");
+    git(repo.path, "config", "protocol.ext.allow", "always");
+    git(repo.path, "remote", "add", "origin", "ext::bb-capture-env");
+
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+
+    expect(bases!.fetchError).toBeTruthy();
+    const env = capturedEnv();
+    expect(env.GH_TOKEN).toBe(AMBIENT_TOKEN);
+    expect(env.GIT_CONFIG_COUNT).toBe("4");
+    expect(env.BB_WS_GH_ACCOUNT).toBeUndefined();
+    expect(credentialFill(repo.path, env, "protocol=https\nhost=github.com\n\n")).toContain(`password=${AMBIENT_TOKEN}`);
+    expect(readFileSync(ghLog, "utf8")).toBe("");
+  });
+
+  it("still tolerates fetch failures for repositories without a marker", async () => {
+    const repo = repository("plain-stale");
+    git(repo.path, "config", "protocol.ext.allow", "always");
+    git(repo.path, "remote", "add", "origin", "ext::bb-capture-env");
+    git(repo.path, "update-ref", "refs/remotes/origin/main", "HEAD");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_plain", workspaceName: "Plain", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: "origin/main" }],
+    });
+
+    expect(prepared.repositories[0]).toMatchObject({ baseRef: "origin/main", baseCommit: repo.commit });
+  });
+
+  it("leaves SSH remotes on their native transport", async () => {
+    const repo = markedRepository("ssh-remote", "repo-account", "ssh://localhost:1/repo.git");
+
+    const [bases] = await readRepositoryBases({ repositories: [{ projectId: "svc", sourcePath: repo.path }], fetch: true });
+
+    expect(bases!.fetchError).toBeTruthy();
+    expect(bases!.fetchError).not.toContain("Cannot resolve");
+    expect(bases!.fetchError).not.toContain("test-token");
+    expect(existsSync(envCapture)).toBe(false);
+    expect(readFileSync(ghLog, "utf8").trim().split("\n")).toEqual([
+      "auth token --user repo-account --hostname github.com",
+    ]);
   });
 });
