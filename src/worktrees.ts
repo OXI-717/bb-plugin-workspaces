@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { baseRefSchema, DEFAULT_BASE_REF, MAX_BASE_REFS, MAX_SESSION_REPOSITORIES } from "./contracts";
@@ -109,6 +109,77 @@ function ghAuthStoreEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+function parseGhAccountMarker(marker: string): string {
+  const account = marker.split("\n").map((line) => line.trim()).find((line) => line.length > 0) ?? "";
+  if (!GH_ACCOUNT_LOGIN.test(account)) throw new Error(`Invalid ${GH_ACCOUNT_MARKER} marker`);
+  return account;
+}
+
+/** Validated `.gh-account` login for a checkout, or undefined when no marker exists. */
+async function readGhAccountMarker(repoPath: string): Promise<string | undefined> {
+  const markerPath = join(repoPath, GH_ACCOUNT_MARKER);
+  try {
+    const stat = await lstat(markerPath);
+    if (!stat.isFile()) throw new Error(`Invalid ${GH_ACCOUNT_MARKER} marker`);
+    return parseGhAccountMarker(await readFile(markerPath, "utf8"));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Writes a `.gh-account` marker with an exclusive create, then verifies the bytes
+ * back through the same handle. A marker this call did not create is never removed:
+ * an existing path fails closed as a conflict, and the post-write unlink only runs
+ * when the path still resolves to the file this handle created.
+ */
+export async function writeGhAccountMarker(markerPath: string, contents: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(markerPath, "wx+", 0o600);
+  } catch (error) {
+    if (errorCode(error) === "EEXIST") {
+      throw new Error(`Conflicting ${GH_ACCOUNT_MARKER} marker in session worktree`);
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(contents, "utf8");
+    const written = Buffer.alloc(contents.length);
+    const { bytesRead } = await handle.read(written, 0, written.length, 0);
+    if (bytesRead !== written.length || written.toString("utf8") !== contents) {
+      throw new Error(`Cannot verify ${GH_ACCOUNT_MARKER} marker in session worktree`);
+    }
+    await handle.close();
+  } catch (error) {
+    const created = await handle.stat().catch(() => null);
+    await handle.close().catch(() => undefined);
+    const current = await lstat(markerPath).catch(() => null);
+    if (created && current && current.dev === created.dev && current.ino === created.ino) {
+      await unlink(markerPath).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Carries a source checkout's `.gh-account` marker into a new worktree so agents can
+ * select the same per-repository GitHub account. Only the validated bare login is
+ * written; extra source lines or secrets are never copied. Fails closed on an
+ * unreadable, invalid, or conflicting marker and on any write or verify failure.
+ * A source without a marker leaves the worktree unmarked.
+ */
+async function propagateGhAccountMarker(sourcePath: string, worktreePath: string): Promise<void> {
+  const account = await readGhAccountMarker(sourcePath);
+  const existing = await readGhAccountMarker(worktreePath);
+  if (existing !== undefined && existing !== account) {
+    throw new Error(`Conflicting ${GH_ACCOUNT_MARKER} marker in session worktree`);
+  }
+  if (account === undefined || existing === account) return;
+  await writeGhAccountMarker(join(worktreePath, GH_ACCOUNT_MARKER), `${account}\n`);
+}
+
 /**
  * Fetch environment for a repository. Repositories declaring a `.gh-account` marker
  * get a scrubbed environment whose appended credential helper resolves that account
@@ -116,15 +187,8 @@ function ghAuthStoreEnv(): NodeJS.ProcessEnv {
  * without the marker keep the ambient environment unchanged.
  */
 async function repositoryFetchEnv(sourcePath: string): Promise<NodeJS.ProcessEnv | undefined> {
-  let marker: string;
-  try {
-    marker = await readFile(join(sourcePath, GH_ACCOUNT_MARKER), "utf8");
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return undefined;
-    throw error;
-  }
-  const account = marker.split("\n").map((line) => line.trim()).find((line) => line.length > 0) ?? "";
-  if (!GH_ACCOUNT_LOGIN.test(account)) throw new Error(`Invalid ${GH_ACCOUNT_MARKER} marker`);
+  const account = await readGhAccountMarker(sourcePath);
+  if (account === undefined) return undefined;
   const env = ghAuthStoreEnv();
   try {
     const { stdout } = await execFileAsync(
@@ -456,6 +520,7 @@ export async function prepareSession(input: {
       const branch = `bb-workspace/${sessionSlug(input.sessionId)}/${repository.alias}`;
       await git(sourcePath, ["worktree", "add", "-b", branch, worktreePath, base.baseCommit]);
       prepared.push({ ...repository, sourcePath, ...base, branch, worktreePath });
+      await propagateGhAccountMarker(sourcePath, worktreePath);
     }
     const manifest: SessionManifest = {
       schemaVersion: 2,
@@ -594,6 +659,7 @@ export async function addRepository(input: {
       } else {
         await git(repository.sourcePath, ["worktree", "add", worktreePath, branch]);
       }
+      await propagateGhAccountMarker(repository.sourcePath, worktreePath);
       const nextManifest: SessionManifest = {
         ...manifest,
         revision: manifest.revision + 1,

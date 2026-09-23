@@ -12,6 +12,7 @@ import {
   readRepositoryBases,
   readRepositoryStatus,
   readSessionManifest,
+  writeGhAccountMarker,
 } from "../src/worktrees";
 import { DEFAULT_BASE_REF } from "../src/contracts";
 
@@ -780,5 +781,181 @@ describe("per-repository fetch credentials", () => {
     expect(readFileSync(ghLog, "utf8").trim().split("\n")).toEqual([
       "auth token --user repo-account --hostname github.com",
     ]);
+  });
+});
+
+describe("worktree gh account marker", () => {
+  /** A checkout whose gitignored `.gh-account` marker `git worktree add` cannot carry over. */
+  function markedSource(name: string, account: string): { path: string; commit: string } {
+    const repo = repository(name);
+    writeFileSync(join(repo.path, ".gitignore"), ".gh-account\n");
+    git(repo.path, "add", ".gitignore");
+    git(repo.path, "commit", "-m", "ignore account marker");
+    writeFileSync(join(repo.path, ".gh-account"), `${account}\n`);
+    return { path: repo.path, commit: git(repo.path, "rev-parse", "HEAD") };
+  }
+
+  it("carries the marker into a new session worktree as a non-secret ignored file", async () => {
+    const repo = markedSource("marked-prepare", "repo-account");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_marked", workspaceName: "Marked", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: repo.commit }],
+    });
+
+    const worktreePath = prepared.repositories[0]!.worktreePath;
+    const markerPath = join(worktreePath, ".gh-account");
+    const marker = readFileSync(markerPath, "utf8");
+    expect(marker).toBe("repo-account\n");
+    expect(marker).not.toMatch(/token|gh[opsur]_|password/i);
+    expect(statSync(markerPath).mode & 0o777).toBe(0o600);
+    expect(await readRepositoryStatus(worktreePath, repo.commit)).toMatchObject({ clean: true, changedFiles: [] });
+
+    await cleanupSession({ dataRoot, sessionId: "session_marked", repositories: prepared.repositories });
+    expect(existsSync(prepared.rootPath)).toBe(false);
+  });
+
+  it("carries the marker when a repository is added to a live session", async () => {
+    const seed = repository("marked-seed");
+    const marked = markedSource("marked-add", "repo-account");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    await prepareSession({
+      dataRoot, sessionId: "session_live", workspaceName: "Live", instructions: "",
+      repositories: [{ projectId: "proj_seed", alias: "seed", sourcePath: seed.path, baseRef: seed.commit }],
+    });
+
+    const added = await addRepository({
+      dataRoot, sessionId: "session_live", operationKey: "add-marked-1",
+      repository: { projectId: "proj_marked", alias: "marked", sourcePath: marked.path, baseRef: marked.commit },
+    });
+
+    expect(readFileSync(join(added.repository.worktreePath, ".gh-account"), "utf8")).toBe("repo-account\n");
+    expect(existsSync(join(dataRoot, "sessions/session_live/repos/seed/.gh-account"))).toBe(false);
+  });
+
+  it("leaves the worktree unmarked when the source has no marker", async () => {
+    const repo = repository("unmarked");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_unmarked", workspaceName: "Unmarked", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: repo.commit }],
+    });
+
+    expect(existsSync(join(prepared.repositories[0]!.worktreePath, ".gh-account"))).toBe(false);
+  });
+
+  it("fails before a usable session when the source marker is invalid", async () => {
+    const repo = repository("bad-marker");
+    writeFileSync(join(repo.path, ".gh-account"), "not an account!!\n");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_badmark", workspaceName: "Bad", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: repo.commit }],
+    })).rejects.toThrow(/Invalid \.gh-account marker/);
+
+    expect(existsSync(join(dataRoot, "sessions", "session_badmark"))).toBe(false);
+    expect(git(repo.path, "branch", "--list", "bb-workspace/session-badmark/*")).toBe("");
+    expect(git(repo.path, "worktree", "list")).not.toContain("session_badmark");
+  });
+
+  it("fails closed when the worktree already has a conflicting marker", async () => {
+    const repo = repository("conflict-marker");
+    writeFileSync(join(repo.path, ".gh-account"), "committed-account\n");
+    git(repo.path, "add", "-f", ".gh-account");
+    git(repo.path, "commit", "-m", "track marker");
+    const commit = git(repo.path, "rev-parse", "HEAD");
+    writeFileSync(join(repo.path, ".gh-account"), "local-account\n");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_conflict", workspaceName: "Conflict", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: commit }],
+    })).rejects.toThrow(/Conflicting \.gh-account marker/);
+
+    expect(existsSync(join(dataRoot, "sessions", "session_conflict"))).toBe(false);
+    expect(git(repo.path, "branch", "--list", "bb-workspace/session-conflict/*")).toBe("");
+    expect(git(repo.path, "worktree", "list")).not.toContain("session_conflict");
+  });
+
+  it("rolls back a live addition when the marker cannot be written", async () => {
+    const seed = repository("writefail-seed");
+    const marked = markedSource("marked-writefail", "repo-account");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_writefail", workspaceName: "Writefail", instructions: "",
+      repositories: [{ projectId: "proj_seed", alias: "seed", sourcePath: seed.path, baseRef: seed.commit }],
+    });
+    const priorAgents = readFileSync(join(prepared.rootPath, "AGENTS.md"), "utf8");
+    const worktreePath = join(prepared.rootPath, "repos", "marked");
+    const branch = "bb-workspace/session-writefail/marked";
+
+    await expect(addRepository({
+      dataRoot, sessionId: "session_writefail", operationKey: "add-marked-1",
+      repository: { projectId: "proj_marked", alias: "marked", sourcePath: marked.path, baseRef: marked.commit },
+      fileOperations: {
+        addWorktree: async () => {
+          git(marked.path, "worktree", "add", worktreePath, branch);
+          symlinkSync(join(marked.path, ".gh-account-dangling-target"), join(worktreePath, ".gh-account"));
+        },
+      },
+    })).rejects.toThrow(/Invalid \.gh-account marker/);
+
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(git(marked.path, "branch", "--list", branch)).toBe("");
+    expect(readSessionManifest(dataRoot, "session_writefail").revision).toBe(1);
+    expect(readFileSync(join(prepared.rootPath, "AGENTS.md"), "utf8")).toBe(priorAgents);
+  });
+
+  it("never removes a marker it did not create", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bb-workspaces-wt-"));
+    roots.push(dir);
+    const markerPath = join(dir, ".gh-account");
+    writeFileSync(markerPath, "other-account\n");
+
+    await expect(writeGhAccountMarker(markerPath, "repo-account\n")).rejects.toThrow(/Conflicting \.gh-account marker/);
+
+    expect(readFileSync(markerPath, "utf8")).toBe("other-account\n");
+    expect(statSync(markerPath).isFile()).toBe(true);
+  });
+
+  it("rejects a symlinked marker instead of following it", async () => {
+    const repo = repository("symlink-marker");
+    writeFileSync(join(repo.path, "marker-target"), "repo-account\n");
+    symlinkSync("marker-target", join(repo.path, ".gh-account"));
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    await expect(prepareSession({
+      dataRoot, sessionId: "session_symlink", workspaceName: "Symlink", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: repo.commit }],
+    })).rejects.toThrow(/Invalid \.gh-account marker/);
+
+    expect(existsSync(join(dataRoot, "sessions", "session_symlink"))).toBe(false);
+    expect(git(repo.path, "worktree", "list")).not.toContain("session_symlink");
+  });
+
+  it("copies only the validated login, never extra source marker lines", async () => {
+    const repo = repository("extra-lines");
+    writeFileSync(join(repo.path, ".gh-account"), "  repo-account  \n\nghp_decoysentinel\n");
+    const dataRoot = mkdtempSync(join(tmpdir(), "bb-workspaces-data-"));
+    roots.push(dataRoot);
+
+    const prepared = await prepareSession({
+      dataRoot, sessionId: "session_lines", workspaceName: "Lines", instructions: "",
+      repositories: [{ projectId: "svc", alias: "svc", sourcePath: repo.path, baseRef: repo.commit }],
+    });
+
+    const marker = readFileSync(join(prepared.repositories[0]!.worktreePath, ".gh-account"), "utf8");
+    expect(marker).toBe("repo-account\n");
+    expect(marker).not.toContain("ghp_decoysentinel");
   });
 });
