@@ -58,8 +58,8 @@ describe("repositories connected by path", () => {
 
   it("starts in an actual worktree on the bound host and never creates a BB project", async () => {
     const { harness, workspace, spawn, create } = await fixture();
-    const session = await harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: 1, hostId: "host_ws", projectIds: [repository.projectId], prompt: "Implement task", requestKey: "local-launch" }) as SessionSnapshot;
-    expect(spawn.mock.calls[0]![0]).toMatchObject({ projectId: "proj_aim", environment: { type: "host", hostId: "host_ws", workspace: { type: "unmanaged", path: session.repositories[0]!.worktreePath } } });
+    const session = await harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: 1, hostId: "host_ws", projectIds: [repository.projectId], prompt: "Implement task", parentThreadId: "thr_owner", requestKey: "local-launch" }) as SessionSnapshot;
+    expect(spawn.mock.calls[0]![0]).toMatchObject({ projectId: "proj_aim", parentThreadId: "thr_owner", environment: { type: "host", hostId: "host_ws", workspace: { type: "unmanaged", path: session.repositories[0]!.worktreePath } } });
     expect(create).not.toHaveBeenCalled();
     expect(harness.inspection.experimental_hostRpcCalls.filter((call) => call.method === "ensure_anchor")).toHaveLength(0);
     await expect(harness.behavior.callRpc("session_start", { workspaceId: workspace.id, expectedRevision: 1, hostId: "host_mac", projectIds: [repository.projectId], prompt: "Implement task", requestKey: "wrong-host" })).rejects.toThrow(/another host/);

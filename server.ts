@@ -59,6 +59,7 @@ export const rpcContract = defineRpcContract({
       workspaceId: z.string(), expectedRevision: z.number().int(), hostId: z.string(),
       projectIds: z.array(z.string()).min(1).max(20), prompt: z.string().trim().min(1).max(100_000),
       name: z.string().trim().min(1).max(80).optional(),
+      parentThreadId: z.string().min(1).optional(),
       requestKey: z.string().min(8).max(200),
       bases: z.record(z.string(), baseRefSchema).optional(),
     }),
@@ -293,7 +294,7 @@ export default async function plugin(bb: BbPluginApi) {
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
-    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey, bases }) => {
+    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, parentThreadId, requestKey, bases }) => {
       const existing = store.getSessionByRequestKey(requestKey);
       if (existing) return existing;
       const workspace = store.get(workspaceId);
@@ -342,6 +343,7 @@ export default async function plugin(bb: BbPluginApi) {
         session = store.updateSession(session.id, { rootPath: prepared.rootPath });
         const thread = await bb.sdk.threads.spawn({
           projectId: workspaceOwnerProjectId,
+          ...(parentThreadId ? { parentThreadId } : {}),
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: workspace.ownerProjectId ? prepared.repositories[0]!.worktreePath : prepared.rootPath } },
           prompt: workspace.ownerProjectId ? `Read ${prepared.rootPath}/AGENTS.md and ${prepared.rootPath}/session.json before working. Write only in your current repository worktree; other repositories need a separate writer thread.\n\n${prompt}` : prompt,
           title: `${workspace.name} · ${sessionName}`, visibility: "visible",
